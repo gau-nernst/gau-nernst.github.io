@@ -1,0 +1,135 @@
+// Color scheme
+$color1: #FCE9D9;
+$color2: #F2B06B;
+$color3: #B05F20;
+$color4: #594F4C;
+$color5: #2F333B;
+
+body {
+    margin: 0;
+    background-color: $color1;
+    font-family: 'IBM Plex Sans';
+}
+
+body > * {
+    margin: 0;
+}
+
+header {
+    position: fixed;
+    top: 0;
+    width: 100vw;
+    background-color: $color3;
+    nav {
+        ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            li {
+                float: left;
+                a {
+                    color: whitesmoke;
+                    text-decoration: none;
+                    background-color: $color3;
+                    display: block;
+                    text-align: center;
+                    padding: 14px 25px;
+            }
+                a:hover {
+                    background-color: $color4;
+                }
+                .active {
+                    color: $color5;
+                }
+            }
+            
+        }
+        
+    }
+}
+
+#intro {
+    background-image: url(assets/background-images/intro.jpg);
+    background-size: cover;
+    background-position: center top;
+    height: 100vh;
+    h1 {
+        margin: 0;
+        padding-left: 10vw;
+        padding-top: 45vh;
+        color: whitesmoke;
+        font-size: 4rem;
+    }
+    p {
+        padding-left: 10vw;
+        color: whitesmoke;
+    }
+}
+
+#about {
+    color: $color5;
+    padding: 100px 10vw;
+    ul {
+        list-style: none;
+        li {
+            display: block;
+            float: left;
+            font-size: 2em;
+            margin: 5px;
+        }
+    }
+}
+
+$active: brightness(0.75);
+$unactive: brightness(0.5);
+
+@keyframes showcase {
+    from {filter: $unactive;}
+    to {filter: $active;}
+}
+
+#showcase {
+    display: flex;
+    flex-flow: row wrap;
+    > * {
+        flex: 1;
+        min-width: 400px;
+        height: 50vh;
+    }
+    h1 {
+        color: $color1;
+        font-size: 3em;
+    }
+    p {
+        color: $color1;
+
+    }
+    #gallery > .background {
+        background-image: url('assets/background-images/gallery.jpg');
+    }
+    #web-apps > .background {
+        background-image: url('assets/background-images/web-apps.png');
+    }
+    .background {
+        background-size: cover;
+        background-position: center center;
+        filter: $unactive;
+        height: 50vh;
+    }
+    .background:hover {
+        animation-name: showcase;
+        animation-duration: 0.5s;
+        filter: $active;
+    }
+    .content {
+        position: relative;
+        top: -50vh;
+        padding-left: 10%;
+    }
+}
+
+footer {
+    padding: 20px 10vw;
+    background-color: $color5;
+    color: $color1;
+}

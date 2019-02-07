@@ -1,0 +1,125 @@
+body {
+  margin: 0;
+  background-color: #FCE9D9;
+  font-family: "IBM Plex Sans";
+}
+
+body > * {
+  margin: 0;
+}
+
+header {
+  position: fixed;
+  top: 0;
+  width: 100vw;
+  background-color: #B05F20;
+}
+header nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+header nav ul li {
+  float: left;
+}
+header nav ul li a {
+  color: whitesmoke;
+  text-decoration: none;
+  background-color: #B05F20;
+  display: block;
+  text-align: center;
+  padding: 14px 25px;
+}
+header nav ul li a:hover {
+  background-color: #594F4C;
+}
+header nav ul li .active {
+  color: #2F333B;
+}
+
+#intro {
+  background-image: url(assets/background-images/intro.jpg);
+  background-size: cover;
+  background-position: center top;
+  height: 100vh;
+}
+#intro h1 {
+  margin: 0;
+  padding-left: 10vw;
+  padding-top: 45vh;
+  color: whitesmoke;
+  font-size: 4rem;
+}
+#intro p {
+  padding-left: 10vw;
+  color: whitesmoke;
+}
+
+#about {
+  color: #2F333B;
+  padding: 100px 10vw;
+}
+#about ul {
+  list-style: none;
+}
+#about ul li {
+  display: block;
+  float: left;
+  font-size: 2em;
+  margin: 5px;
+}
+
+@keyframes showcase {
+  from {
+    filter: brightness(0.5);
+  }
+  to {
+    filter: brightness(0.75);
+  }
+}
+#showcase {
+  display: flex;
+  flex-flow: row wrap;
+}
+#showcase > * {
+  flex: 1;
+  min-width: 400px;
+  height: 50vh;
+}
+#showcase h1 {
+  color: #FCE9D9;
+  font-size: 3em;
+}
+#showcase p {
+  color: #FCE9D9;
+}
+#showcase #gallery > .background {
+  background-image: url("assets/background-images/gallery.jpg");
+}
+#showcase #web-apps > .background {
+  background-image: url("assets/background-images/web-apps.png");
+}
+#showcase .background {
+  background-size: cover;
+  background-position: center center;
+  filter: brightness(0.5);
+  height: 50vh;
+}
+#showcase .background:hover {
+  animation-name: showcase;
+  animation-duration: 0.5s;
+  filter: brightness(0.75);
+}
+#showcase .content {
+  position: relative;
+  top: -50vh;
+  padding-left: 10%;
+}
+
+footer {
+  padding: 20px 10vw;
+  background-color: #2F333B;
+  color: #FCE9D9;
+}
+
+/*# sourceMappingURL=style.css.map */
