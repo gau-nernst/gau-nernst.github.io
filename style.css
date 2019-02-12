@@ -69,51 +69,56 @@ header nav ul li .active {
   margin: 5px;
 }
 
-@keyframes showcase {
+@keyframes onHover {
   from {
-    filter: brightness(0.5);
+    filter: brightness(0.6);
   }
   to {
-    filter: brightness(0.75);
+    filter: brightness(0.9);
   }
 }
 #showcase {
   display: flex;
   flex-flow: row wrap;
+  background-color: #594F4C;
 }
 #showcase > * {
   flex: 1;
   min-width: 400px;
-  height: 50vh;
+  min-height: 300px;
+  background-position: center center;
+  background-size: cover;
 }
 #showcase h1 {
-  color: #FCE9D9;
+  color: whitesmoke;
   font-size: 3em;
+  padding-left: 9vw;
 }
 #showcase p {
-  color: #FCE9D9;
+  color: whitesmoke;
+  padding-left: 9vw;
 }
-#showcase #gallery > .background {
+#showcase a {
+  text-decoration-line: none;
+}
+#showcase #gallery .image {
   background-image: url("assets/background-images/gallery.jpg");
 }
-#showcase #web-apps > .background {
+#showcase #web-apps .image {
   background-image: url("assets/background-images/web-apps.png");
 }
-#showcase .background {
-  background-size: cover;
+#showcase .image {
+  display: block;
   background-position: center center;
-  filter: brightness(0.5);
-  height: 50vh;
+  background-size: cover;
+  height: 200px;
+  margin: 50px 0px 0px 0px;
+  filter: brightness(0.6);
 }
-#showcase .background:hover {
-  animation-name: showcase;
+#showcase .image:hover {
+  animation-name: onHover;
   animation-duration: 0.5s;
-  filter: brightness(0.75);
-}
-#showcase .content {
-  position: relative;
-  top: -50vh;
-  padding-left: 10%;
+  filter: brightness(0.9);
 }
 
 footer {
