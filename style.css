@@ -1,130 +1,57 @@
-body {
-  margin: 0;
-  background-color: #FCE9D9;
-  font-family: "IBM Plex Sans";
+:root {
+  --color-1: #FCE9D9;
+  --color-2: #F2B06B;
+  --color-3: #B05F20;
+  --color-4: #594F4C;
+  --color-5: #2F333B;
 }
 
-body > * {
-  margin: 0;
-}
+h1 { font-size: 4rem; }
+h2 { font-size: 3rem; }
+h3 { font-size: 2rem; }
+a { text-decoration-line: none; }
+ul { list-style: none; }
 
-header {
-  position: fixed;
-  top: 0;
-  width: 100vw;
-  background-color: #B05F20;
-}
-header nav ul {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-header nav ul li {
-  float: left;
-}
-header nav ul li a {
-  color: whitesmoke;
-  text-decoration: none;
-  background-color: #B05F20;
-  display: block;
-  text-align: center;
-  padding: 14px 25px;
-}
-header nav ul li a:hover {
-  background-color: #594F4C;
-}
-header nav ul li .active {
-  color: #2F333B;
-}
+body { margin: 0; background-color: var(--color-1); font-family: "IBM Plex Sans"; }
+header { position: fixed; top: 0; width: 100vw; background-color: var(--color-3); }
+section { padding: 0px 10vw; }
+footer { padding: 20px 10vw; background-color: #2F333B; color: #FCE9D9; }
+
+nav ul { margin: 0; padding: 0; }
+nav li { float: left; }
+nav a { color: whitesmoke; text-decoration: none; background-color: rgba(0,0,0,0); display: block; text-align: center; padding: 14px 25px; }
+nav a:hover { background-color: var(--color-4); }
 
 #intro {
   background-image: url(assets/background-images/intro.jpg);
-  background-size: cover;
-  background-position: center top;
-  height: 100vh;
+  background-size: cover; background-position: center top;
+  height: 100vh; color: whitesmoke;
 }
-#intro h1 {
-  margin: 0;
-  padding-left: 10vw;
-  padding-top: 45vh;
-  color: whitesmoke;
-  font-size: 4rem;
-}
-#intro p {
-  padding-left: 10vw;
-  color: whitesmoke;
-}
+#intro h1 { margin: 0; padding-top: 45vh; }
 
-#about {
-  color: #2F333B;
-  padding: 100px 10vw;
-}
-#about ul {
-  list-style: none;
-}
-#about ul li {
-  display: block;
-  float: left;
-  font-size: 2em;
-  margin: 5px;
+#about { color: #2F333B; padding-bottom: 100px; }
+#about li { display: block; float: left; font-size: 2em; margin: 5px; }
+
+:root { 
+  --start: brightness(0.6) grayscale(1); 
+    --end: brightness(0.9) grayscale(1);
 }
 
 @keyframes onHover {
-  from {
-    filter: brightness(0.6);
-  }
-  to {
-    filter: brightness(0.9);
-  }
+  from { filter: var(--start); }
+    to { filter: var(--end); }
 }
-#showcase {
-  display: flex;
-  flex-flow: row wrap;
-  background-color: #594F4C;
-}
-#showcase > * {
-  flex: 1;
-  min-width: 400px;
-  min-height: 300px;
-  background-position: center center;
-  background-size: cover;
-}
-#showcase h1 {
-  color: whitesmoke;
-  font-size: 3em;
-  padding-left: 9vw;
-}
-#showcase p {
-  color: whitesmoke;
-  padding-left: 9vw;
-}
-#showcase a {
-  text-decoration-line: none;
-}
-#showcase #gallery .image {
-  background-image: url("assets/background-images/gallery.jpg");
-}
-#showcase #web-apps .image {
-  background-image: url("assets/background-images/web-apps.png");
-}
+
+#showcase { display: flex; flex-flow: row wrap; background-color: var(--color-4); padding-bottom: 70px; }
+#showcase > * { flex: 1 1; min-width: 400px; min-height: 300px; margin: 0px 60px;}
+#showcase h3 { color: whitesmoke; font-size: 3rem; text-align: center; }
+#showcase p { color: whitesmoke; padding-left: 10%; }
+
 #showcase .image {
-  display: block;
-  background-position: center center;
-  background-size: cover;
-  height: 200px;
-  margin: 50px 0px 0px 0px;
-  filter: brightness(0.6);
+  display: block; background-position: center center; background-size: cover;
+  height: 300px; margin: 50px 0px 0px 0px; filter: var(--start);
 }
-#showcase .image:hover {
-  animation-name: onHover;
-  animation-duration: 0.5s;
-  filter: brightness(0.9);
-}
+#showcase .image:hover { animation-name: onHover; animation-duration: 0.5s; filter: var(--end); }
 
-footer {
-  padding: 20px 10vw;
-  background-color: #2F333B;
-  color: #FCE9D9;
-}
-
-/*# sourceMappingURL=style.css.map */
+#showcase #gallery  .image { background-image: url("assets/background-images/gallery.jpg"); }
+#showcase #web-apps .image { background-image: url("assets/background-images/web-apps.png"); }
