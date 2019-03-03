@@ -42,8 +42,8 @@ nav a:hover { background-color: var(--color-4); }
     to { filter: var(--end); }
 }
 
-#showcase { display: flex; flex-flow: row wrap; background-color: var(--color-4); padding-bottom: 70px; }
-#showcase > * { flex: 1 1; min-width: 400px; min-height: 300px; margin: 0px 60px;}
+#showcase { display: flex; flex-flow: row wrap; background-color: var(--color-4); padding-bottom: 70px; padding: 0px; }
+#showcase > * { flex: 1 1; min-width: 50vh; min-height: 300px; margin: 0px;}
 #showcase h3 { color: whitesmoke; font-size: 3rem; text-align: center; }
 #showcase p { color: whitesmoke; padding-left: 10%; }
 
