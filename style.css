@@ -6,32 +6,46 @@
   --color-5: #2F333B;
 }
 
+html { scroll-behavior: smooth; }
+
 h1 { font-size: 4rem; }
 h2 { font-size: 3rem; }
 h3 { font-size: 2rem; }
-a { text-decoration: none; color: whitesmoke; }
+a { text-decoration: none; color: whitesmoke; transition: 0.2s; }
 ul { list-style: none; }
 
 body { margin: 0; background-color: var(--color-5); font-family: "IBM Plex Sans"; }
 header { position: fixed; top: 0; width: 100vw; background-color: var(--color-4); }
-section { padding: 0px 10vw; }
-footer { padding: 20px 10vw; background-color: var(--color-5); color: whitesmoke; }
+section { padding: 30px 10vw; }
+footer { padding: 20px 10vw; background-color: var(--color-5); color: whitesmoke; transition: 0.5s ease-in-out; }
 
 nav ul { margin: 0; padding: 0; }
 nav li { float: left; }
-nav a { background-color: rgba(0,0,0,0); display: block; text-align: center; padding: 14px 25px; }
+nav a { background-color: rgba(0,0,0,0); display: block; text-align: center; padding: 14px 25px; transition: 0.2s; }
 nav a:hover { background-color: var(--color-3); }
 
+@keyframes appear {
+  from {
+    transform: translate(0,20vh);
+    filter: opacity(0.2);
+  }
+  to {
+    filter: opacity(1);
+  }
+}
+
 #intro {
-  background-image: url(assets/background-images/background.jpg);
+  background-image: url(assets/background-images/background2.jpg);
   background-size: cover; background-position: center top;
   background-attachment: fixed;
   background-color: var(--color-5); height: 100vh; color: whitesmoke;
-  padding-top: 1px;
+  padding-top: 1px; transition: 0.5s ease-in-out;
 }
-#intro h1 { margin-top: 45vh; }
+#intro h1 { margin-top: 40vh; animation: appear 0.5s ease-in-out; }
 
-#about { color: whitesmoke; padding-bottom: 100px; }
+#about { 
+  color: whitesmoke; padding-bottom: 100px; 
+  transition: 0.5s ease-in-out; }
 #about li { margin: 5px; display: block; float: left; padding-right: 10px; }
 #about a:hover { color: var(--color-2); }
 .fab { color: whitesmoke; font-size: 2em; padding: 5px; }
@@ -41,21 +55,18 @@ nav a:hover { background-color: var(--color-3); }
     --end: brightness(0.9) grayscale(1);
 }
 
-@keyframes onHover {
-  from { filter: var(--start); }
-    to { filter: var(--end); }
-}
-
-#showcase { margin-top: 50px; display: flex; flex-flow: row wrap; background-color: var(--color-4); padding-bottom: 70px; padding: 0px; }
-#showcase > * { flex: 1 1; min-width: 50vh; min-height: 300px; margin: 0px;}
+#showcase { margin-top: 50px; padding-bottom: 70px; padding: 0px;
+  display: flex; flex-flow: row wrap; 
+  background-color: var(--color-4); }
+#showcase > * { flex: 1 1; min-width: 50vh; min-height: 300px; margin: 0px; }
 #showcase h3 { color: whitesmoke; font-size: 3rem; text-align: center; }
 #showcase p { color: whitesmoke; padding: 0 10%; }
 
 #showcase .image {
   display: block; background-position: center center; background-size: cover;
-  height: 300px; margin: 50px 0px 0px 0px; filter: var(--start);
+  height: 300px; margin: 50px 0px 0px 0px; filter: var(--start); transition: 0.5s;
 }
-#showcase .image:hover { animation-name: onHover; animation-duration: 0.5s; filter: var(--end); }
+#showcase .image:hover { filter: var(--end); }
 
 #showcase #gallery  .image { background-image: url("assets/background-images/gallery.jpg"); }
 #showcase #web-apps .image { background-image: url("assets/background-images/web-apps.png"); }
