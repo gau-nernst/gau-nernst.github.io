@@ -9,7 +9,7 @@
 h1 { font-size: 4rem; }
 h2 { font-size: 3rem; }
 h3 { font-size: 2rem; }
-a { text-decoration-line: none; }
+a { text-decoration: none; color: whitesmoke; }
 ul { list-style: none; }
 
 body { margin: 0; background-color: var(--color-5); font-family: "IBM Plex Sans"; }
@@ -19,7 +19,7 @@ footer { padding: 20px 10vw; background-color: var(--color-5); color: whitesmoke
 
 nav ul { margin: 0; padding: 0; }
 nav li { float: left; }
-nav a { color: whitesmoke; text-decoration: none; background-color: rgba(0,0,0,0); display: block; text-align: center; padding: 14px 25px; }
+nav a { background-color: rgba(0,0,0,0); display: block; text-align: center; padding: 14px 25px; }
 nav a:hover { background-color: var(--color-3); }
 
 #intro {
@@ -32,9 +32,9 @@ nav a:hover { background-color: var(--color-3); }
 #intro h1 { margin-top: 45vh; }
 
 #about { color: whitesmoke; padding-bottom: 100px; }
-#about li { display: block; float: left; font-size: 2em; margin: 5px; }
-.fab { color: whitesmoke; }
-.fab:hover { color: var(--color-3); }
+#about li { margin: 5px; display: block; float: left; padding-right: 10px; }
+#about a:hover { color: var(--color-2); }
+.fab { color: whitesmoke; font-size: 2em; padding: 5px; }
 
 :root { 
   --start: brightness(0.6) grayscale(1); 
@@ -46,7 +46,7 @@ nav a:hover { background-color: var(--color-3); }
     to { filter: var(--end); }
 }
 
-#showcase { display: flex; flex-flow: row wrap; background-color: var(--color-4); padding-bottom: 70px; padding: 0px; }
+#showcase { margin-top: 50px; display: flex; flex-flow: row wrap; background-color: var(--color-4); padding-bottom: 70px; padding: 0px; }
 #showcase > * { flex: 1 1; min-width: 50vh; min-height: 300px; margin: 0px;}
 #showcase h3 { color: whitesmoke; font-size: 3rem; text-align: center; }
 #showcase p { color: whitesmoke; padding: 0 10%; }
@@ -59,3 +59,6 @@ nav a:hover { background-color: var(--color-3); }
 
 #showcase #gallery  .image { background-image: url("assets/background-images/gallery.jpg"); }
 #showcase #web-apps .image { background-image: url("assets/background-images/web-apps.png"); }
+
+footer a { color: var(--color-2); }
+footer a:hover { color: var(--color-3); }
