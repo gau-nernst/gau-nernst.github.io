@@ -14,18 +14,13 @@ ul { list-style: none; }
 
 body { margin: 0; background-color: var(--color-5); font-family: "IBM Plex Sans"; }
 header { position: fixed; top: 0; width: 100vw; background-color: var(--color-4); }
-section { padding: 0px 10vw; transition: 0.5s ease-in-out; }
+section { padding: 0px 10vw; transition: 0.5s ease-in-out; padding-top: 20px; }
 footer { padding: 20px 10vw; background-color: var(--color-5); color: whitesmoke; transition: 0.5s ease-in-out; }
 
 nav ul { margin: 0; padding: 0; }
 nav li { float: left; }
 nav a { background-color: rgba(0,0,0,0); display: block; text-align: center; padding: 14px 25px; }
 nav a:hover { background-color: var(--color-3); }
-
-@keyframes appear {
-  from { transform: translate(0,10vh); opacity: 0.2; }
-  to { opacity: 1; }
-}
 
 #intro {
   background-image: url(assets/background-images/background2.jpg);
@@ -34,7 +29,16 @@ nav a:hover { background-color: var(--color-3); }
   background-color: var(--color-5); height: 100vh; color: whitesmoke;
   padding-top: 1px;
 }
-#intro h1 { margin-top: 45vh; animation: appear 0.5s ease-in-out;}
+#intro h1 { margin-top: 43vh; text-align: center; }
+@media only screen and (max-width: 600px) {
+  #intro h1 { font-size: 3rem; }
+}
+#intro i { font-size: 2rem; }
+#intro button { 
+  background-color: rgba(0,0,0,0.3); border: none; border-radius: 100px; 
+  display: block; margin: auto; padding: 10px; 
+  transition: 0.2s ease-in-out; }
+#intro button:hover { background-color: var(--color-4); }
 
 #about { color: whitesmoke; }
 #about li { margin: 5px; display: inline-block; padding-right: 10px; }
