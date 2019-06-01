@@ -11,49 +11,51 @@
     <link rel="stylesheet" type="text/css" media="screen" href="style.css" />
     <!-- Load Google fonts -->
     <link href="https://fonts.googleapis.com/css?family=IBM+Plex+Mono|IBM+Plex+Sans|IBM+Plex+Sans+Condensed|IBM+Plex+Serif|Nunito+Sans|Roboto" rel="stylesheet"> 
-    <!-- Load Font Awesome-->
-    <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.1/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
 </head>
 <body>
-    <header>
-        <nav>
-            <ul>
-                <li><a href='#intro'>Home</a></li>
-                <li><a href='#about'>About me</a></li>
-                <li><a href='#showcase'>Explore</a></li>
-            </ul>
-        </nav>
-    </header>
+    <nav>
+    <label for="nav-toggle">Navigation</label>
+    <input type="checkbox" id="nav-toggle">
+    <ul id="nav-flex">
+        <li><a href='#intro'>Home</a></li>
+        <li><a href='#about'>About me</a></li>
+        <li><a href='#showcase'>Explore</a></li>
+    </ul>
+    </nav>
 
     <section id="intro">
         <h1>Thien Tran</h1>
-        <p></p>
-        <button><a href="#about"><i class="fas fa-arrow-down"></i></a></button>
+        <button>Aspiring Engineer. Wanderer around Singapore.</button>
+        <a href="#about"><button>Let's dive in!</button></a>
     </section>
 
     <section id="about">
         <h2>About me</h2>
-        <p>I'm Thien. This website hosts my personal projects on various topics. Feel free to browse them below.</p>
+        <p>I'm Thien, or 天 (tian) in Mandarin. Starbucks baristas often call me Theodore.<br>
+            I will be a freshman in NTU EEE this year. This website hosts my personal projects on various topics. Feel free to browse them below.</p>
         <p>You can find me on</p>
         <ul>
-            <li><i class="fab fa-instagram"></i><a href="https://www.instagram.com/gau.nernst/" target="_blank">@gau.nernst</a></li>
-            <li><i class="fab fa-github"></i><a href="https://github.com/gau-nernst" target="_blank">gau-nernst</a></li>
-            <li><i class="fab fa-linkedin"></i><a href="https://www.linkedin.com/in/thientran99/" target="_blank">Thien Tran</a></li>
+            <li><object type="image/svg+xml" data="assets/icons/instagram-brands.svg" class="inline-icon"></object>
+                <a href="https://www.instagram.com/gau.nernst/" target="_blank">@gau.nernst</a></li>
+            <li><object type="image/svg+xml" data="assets/icons/github-brands.svg" class="inline-icon"></object>
+                <a href="https://github.com/gau-nernst" target="_blank">gau-nernst</a></li>
+            <li><object type="image/svg+xml" data="assets/icons/linkedin-brands.svg" class="inline-icon"></object>
+                <a href="https://www.linkedin.com/in/thientran99/" target="_blank">Thien Tran</a></li>
         </ul>
 
     </section>
 
     <section id="showcase">
-        <div id="gallery">
+        <div>
             <h3>Gallery</h3>
-            <p>My selected works in Photography and Acrylic Painting. (layout not working)</p>
-            <a href="gallery/"><div class="image"></div></a>
+            <p>My selected works in Photography and Acrylic Painting. (This is not working. Please don't go in)</p>
+            <a href="gallery/"><img src="assets/background-images/gallery.jpg"></a>
         </div>
     
-        <div id="web-apps">
+        <div>
             <h3>Web Apps</h3>
-            <p>Simple web applications, mainly to demonstrate Physics and Maths concepts</p>
-            <a href="web-apps/"><div class="image"></div></a>
+            <p>Simple web applications, mainly to demonstrate Physics and Maths concepts. (Nothing much here)</p>
+            <a href="web-apps/"><img src="assets/background-images/web-apps.png"></a>
         </div>
     </section>
     
