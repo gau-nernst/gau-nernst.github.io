@@ -64,6 +64,7 @@ nav li:hover { background-color: var(--color-3); }
 #showcase h3 { font-size: 3rem; text-align: center; margin: 1rem 0; }
 #showcase p { margin: 2rem var(--space-largest); }
 #showcase img { display: block; width: 100%; height: 30vh; object-fit: cover; }
+#showcase img:hover { filter: brightness(1.3); transition: 0.2s; }
 
 footer a { color: var(--color-2); }
 footer a:hover { color: var(--color-3); }
