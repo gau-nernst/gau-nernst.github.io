@@ -37,7 +37,7 @@ a:hover {
 ul { list-style: none; }
 section { max-width: 45rem; margin: auto; }
 
-section, footer { padding: 20px 5rem; }
+section, footer { padding: 20px 2rem; }
 footer { background-color: var(--color-5); }
 
 #intro {
