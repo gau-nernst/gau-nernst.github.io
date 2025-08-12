@@ -1,0 +1,20 @@
+baseURL = "https://gau-nernst.github.io/"
+languageCode = 'en-us'
+title = "gau-nernst's blog"
+theme = "paper"
+
+[params]
+  color = "linen"  # linen, wheat, gray, light
+
+  # header social icons
+  twitter = "gaunernst"
+  github = "gau-nernst"
+
+  # home page profile
+  avatar = 'gau.nernst@yahoo.com.sg'
+  name = 'Thien Tran'
+  # bio = 'YOUR_BIO'
+
+[caches]
+  [caches.images]
+    dir = ':cacheDir/images'
