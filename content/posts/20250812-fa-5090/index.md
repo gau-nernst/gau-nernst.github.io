@@ -118,7 +118,7 @@ void global_to_shared(uint32_t dst, const nv_bfloat16 *src, int src_stride, int 
 }
 ```
 
-TODO: diagram of 2D tile from global to shared
+{{< figure src="global_to_shared.svg" alt="Global to Shared data transfer" caption="2D tile copy from Global memory to Shared memory." >}}
 
 We will use inline assembly to write `cp.async.cg.shared.global`. This PTX does 16-byte transfer, or 8 BF16 elements (`num_elems = 16 / sizeof(nv_bfloat16)`), for each CUDA thread. To ensure coalesced memory access, consecutive threads will be responsible for consecutive groups of 8xBF16.
 
@@ -215,7 +215,7 @@ void attention_v1_kernel(
     float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4] = {};  // act as C/D in MMA
 
     // load K global->shared->registers [BLOCK_KV, DIM]
-    // similar to loading Q, except we will use ldmatrix_x2()
+    // similar to loading Q, except we use ldmatrix_x2()
     ...
 
     // 1st MMA: S = Q @ K.T
@@ -231,7 +231,7 @@ void attention_v1_kernel(
     ...
 
     // load V global->shared->registers [BLOCK_KV, DIM]
-    // similar to loading K, except we will use ldmatrix_x2_trans()
+    // similar to loading K, except we use ldmatrix_x2_trans()
     ...
 
     // 2nd MMA: O = P @ V
@@ -257,7 +257,7 @@ void attention_v1_kernel(
 }
 ```
 
-`ldmatrix_x4()` corresponds to `ldmatrix.sync.aligned.m8n8.x4.b16`, and `mma_m16n8k16()` corresponds to `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` in PTX. They are just simple wrappers around inline assembly of the PTX instructions. Refer to [common.h](https://github.com/gau-nernst/learn-cuda/blob/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention/common.h) for more details.
+`ldmatrix_x4()` (and its variants) corresponds to `ldmatrix.sync.aligned.m8n8.x4.b16`, and `mma_m16n8k16()` corresponds to `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` in PTX. They are just simple wrappers around inline assembly of the PTX instructions. Refer to [common.h](https://github.com/gau-nernst/learn-cuda/blob/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention/common.h) for more details.
 
 ### Online softmax
 
