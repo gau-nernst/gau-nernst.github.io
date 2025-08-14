@@ -140,7 +140,7 @@ Since we are using `mma.m16n8k16` instruction, each MMA 16x8 output tile (`m16n8
 - A tile `m16k16` requires four 8x8 tiles -> `ldmatrix.x4`
 - B tile `n8k16` requires two 8x8 tiles -> `ldmatrix.x2`
 
-Only Q acts as A in an MMA. Both K and V act as B in their MMAs, though K will require transposed `ldmatrix` for correct layout (everything is assumed to be row-major in global memory).
+Only Q acts as A in an MMA. Both K and V act as B in their MMAs, though K will require transposed `ldmatrix` for correct layout (all tensors use row-major layout in global and shared memory).
 
 To use `ldmatrix`, each thread supplies the address of each row. Threads 0-7 select the 1st 8x8 tile, threads 8-15 select the 2nd 8x8 tile, and so on. The [layout of A](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float) in the official PTX documentation can look confusing. But it's easier (at least for me) to focus on the order of 8x8 tiles.
 
