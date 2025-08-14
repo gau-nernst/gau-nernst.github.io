@@ -282,11 +282,10 @@ void attention_v1_kernel(
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
       const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
       const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
-      nv_bfloat16 *O_ptr = O + row * DIM + col;
 
       float *regs = O_rmem[mma_id_q][mma_id_d];
-      reinterpret_cast<nv_bfloat162 *>(O_ptr)[0]           = __float22bfloat162_rn({regs[0], regs[1]});
-      reinterpret_cast<nv_bfloat162 *>(O_ptr + 8 * DIM)[0] = __float22bfloat162_rn({regs[2], regs[3]});
+      reinterpret_cast<nv_bfloat162 *>(O + (row + 0) * DIM + col)[0] = __float22bfloat162_rn({regs[0], regs[1]});
+      reinterpret_cast<nv_bfloat162 *>(O + (row + 8) * DIM + col)[0] = __float22bfloat162_rn({regs[2], regs[3]});
     }
 }
 
