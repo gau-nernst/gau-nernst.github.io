@@ -15,6 +15,12 @@ theme = "paper"
   name = 'Thien Tran'
   # bio = 'YOUR_BIO'
 
+[markup]
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
+    ordered = true
+
 [caches]
   [caches.images]
     dir = ':cacheDir/images'

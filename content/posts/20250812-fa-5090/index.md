@@ -23,6 +23,8 @@ v5 (better pipelining)         | 197.74 | 94.39%
 
 Do note that although I only use Ampere features in these implementations (sm120 supports `cp.async.bulk` i.e. TMA, but I don't use it here), my implementations might not run performantly on earlier generations of GPUs. Due to improvements in newer hardware, you might need to use more tricks to reach Speed-of-Light on older GPUs e.g. pipeline shared memory to register memory data movements.
 
+{{< toc >}}
+
 ## Flash Attention algorithm
 
 Let's start with the reference implementation of attention.
