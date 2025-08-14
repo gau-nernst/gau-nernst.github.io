@@ -140,15 +140,50 @@ Since we are using `mma.m16n8k16` instruction, each MMA 16x8 output tile (`m16n8
 
 Only Q acts as A in an MMA. Both K and V act as B in their MMAs, though K will require transposed `ldmatrix` for correct layout (everything is assumed to be row-major in global memory).
 
+To use `ldmatrix`, each thread supplies the address of each row. Threads 0-7 select the 1st 8x8 tile, threads 8-15 select the 2nd 8x8 tile, and so on. The [layout of A](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float) in the official PTX documentation can look confusing. But it's easier (at least for me) to focus on the order of 8x8 tiles.
+
+{{< figure src="ldmatrix.svg" alt="ldmatrix for MMA layout" caption="Order of `ldmatrix` tiles in `mma.m16n8k16`." align="center">}}
+
+With the visualisation above, I hope the following snippet makes sense
+
+```cpp
+constexpr int MMA_M = 16;
+constexpr int MMA_N = 8;
+constexpr int MMA_K = 16;
+
+uint32_t Q_smem;
+uint32_t Q_rmem[WARP_Q / MMA_M][DIM / MMA_K][4];
+
+for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
+  for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++) {
+    const int row = (warp_id * WARP_Q) + (mma_id_q * MMA_M) + (lane_id % 16);
+    const int col = (mma_id_d * MMA_K) + (lane_id / 16 * 8);
+    const uint32_t addr = Q_smem + (row * DIM + col) * sizeof(nv_bfloat16);
+    ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
+  }
+```
+
+- The two nested loops tile `[MMA_M, MMA_K]` (i.e. `[16, 16]`) over `[WARP_Q, DIM]` in shared memory.
+- `(warp_id * WARP_Q)` selects the warp tile. We don't need this for K and V.
+- `(mma_id_q * MMA_M)` in `row` and `(mma_id_d * MMA_K)` in `col` selects the MMA tile.
+- `(lane_id % 16)` in `row` and `(lane_id / 16 * 8)` in `col` select the correct row address for each thread, following the required Multiplicand A layout (see the figure above).
+
+`ldmatrix_x4()` is a small wrapper around `ldmatrix.sync.aligned.m8n8.x4.b16` PTX for convenience. You can refer to [common.h](https://github.com/gau-nernst/learn-cuda/blob/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention/common.h) for more details.
+
+K and V can be loaded from shared to register memory similarly. One thing to note is about the row-major / column-major layout when using `ldmatrix`. Regardless of whether `.trans` modifier is used, each thread still provides the row address of each row in 8x8 tiles. `.trans` only changes the **register layout** of `ldmatrix` results.
+
+TOOD: add a figure here.
+
 ### Draft version
 
-Our draft version looks like this
+We have the high-level tile-based design, and know how to load the data for MMA. Calling MMA is simple - just drop `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` PTX in our code. Our draft version looks like this.
 
 ```cpp
 constexpr int BLOCK_Q = 128;
 constexpr int BLOCK_KV = 64;
 constexpr int DIM = 128;
 constexpr int NUM_WARPS = 4;
+constexpr int TB_SIZE = NUM_WARPS * 32;
 
 // mma.m16n8k16
 constexpr int MMA_M = 16;
@@ -169,7 +204,6 @@ void attention_v1_kernel(
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
   const int lane_id = tid % 32;
-  constexpr int TB_SIZE = NUM_WARPS * 32;
 
   // increment Q, K, V, O based on blockIdx.x
   ...
@@ -203,7 +237,7 @@ void attention_v1_kernel(
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++) {
       const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id % 16);
       const int col = mma_id_d * MMA_K + (lane_id / 16 * 8);
-      const uint32_t addr = Q_shm + (row * DIM + col) * sizeof(nv_bfloat16);
+      const uint32_t addr = Q_smem + (row * DIM + col) * sizeof(nv_bfloat16);
       ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
     }
   __syncthreads();
@@ -244,7 +278,6 @@ void attention_v1_kernel(
   }
 
   // write output
-  // it kinda correspond to Q tile
   for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
     for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
       const int row = warp_id * WARP_Q + mma_id_q * MMA_M + (lane_id / 4);
@@ -255,9 +288,33 @@ void attention_v1_kernel(
       reinterpret_cast<nv_bfloat162 *>(O_ptr + 8 * DIM)[0] = __float22bfloat162_rn({regs[2], regs[3]});
     }
 }
+
+// kernel launcher
+void attention_v1(
+  const nv_bfloat16 *Q,  // [bs, len_q, DIM]
+  const nv_bfloat16 *K,  // [bs, len_kv, DIM]
+  const nv_bfloat16 *V,  // [bs, len_kv, DIM]
+  nv_bfloat16 *O,        // [bs, len_q, DIM]
+  int bs,
+  int len_q,
+  int len_kv) {
+
+  // 1 threadblock for each BLOCK_Q
+  const int num_blocks = bs * cdiv(len_q, BLOCK_Q);
+
+  // Q overlap with K+V.
+  const int smem_size = max(BLOCK_Q, BLOCK_KV * 2) * DIM * sizeof(nv_bfloat16);
+
+  // use dynamic shared memory so we can allocate more than 48kb if needed.
+  if (smem_size > 48'000)
+    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  attention_v1_kernel<<<num_blocks, TB_SIZE, smem_size>>>(Q, K, V, O, bs, len_q, len_kv);
+  CUDA_CHECK(cudaGetLastError());
+}
 ```
 
-`ldmatrix_x4()` (and its variants) corresponds to `ldmatrix.sync.aligned.m8n8.x4.b16`, and `mma_m16n8k16()` corresponds to `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` in PTX. They are just simple wrappers around inline assembly of the PTX instructions. Refer to [common.h](https://github.com/gau-nernst/learn-cuda/blob/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention/common.h) for more details.
+Now, let's tackle online softmax.
 
 ### Online softmax
 
