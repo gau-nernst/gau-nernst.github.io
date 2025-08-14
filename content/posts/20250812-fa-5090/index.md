@@ -284,6 +284,7 @@ void attention_v1_kernel(
       const int col = mma_id_d * MMA_N + (lane_id % 4) * 2;
       nv_bfloat16 *O_ptr = O + row * DIM + col;
 
+      float *regs = O_rmem[mma_id_q][mma_id_d];
       reinterpret_cast<nv_bfloat162 *>(O_ptr)[0]           = __float22bfloat162_rn({regs[0], regs[1]});
       reinterpret_cast<nv_bfloat162 *>(O_ptr + 8 * DIM)[0] = __float22bfloat162_rn({regs[2], regs[3]});
     }
