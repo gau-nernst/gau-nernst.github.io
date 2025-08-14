@@ -1,5 +1,5 @@
 +++
-date = '2025-08-12T18:38:59+08:00'
+date = '2025-08-14T18:38:59+08:00'
 draft = true
 title = 'Writing Speed-of-Light Flash Attention for 5090 in CUDA C++'
 url = 'fa-5090'
@@ -122,7 +122,7 @@ void global_to_shared(uint32_t dst, const nv_bfloat16 *src, int src_stride, int 
 
 We will use inline assembly to write `cp.async.cg.shared.global`. This PTX does 16-byte transfer, or 8 BF16 elements (`num_elems = 16 / sizeof(nv_bfloat16)`), for each CUDA thread. To ensure coalesced memory access, consecutive threads will be responsible for consecutive groups of 8xBF16.
 
-TODO: diagram of consecutive 8 elements
+{{< figure src="coalesced.svg" alt="Coalesced memory access" caption="Consecutive threads are responsible for consecutive groups of 8xBF16." align="center">}}
 
 Note:
 - The loop `for (int iter = 0; iter < num_iters; iter++)` is written this way so that the compiler (`nvcc`) can fully unroll the loop. `num_iters` is known at compile time (guaranteed by `constexpr`). If we mix `tid` in the loop, which is a "dynamic" variable to the compiler, the loop can't be unrolled, even when we know certain constraints about the variable i.e. `tid < TB_SIZE`.
@@ -132,7 +132,7 @@ Note:
 
 When doing global->shared data transfer, we think in terms of threadblock tiles and individual CUDA threads. For shared->register data transfer, since this is to service the later MMA instruction, we think in terms of warp/MMA tiles and warps. Following Flash Attention 2 (section 3.3), we let each warp in a threadblock handle a portion of `tile_Q`, splitting along the Q sequence length dimension. This means that different warps will index into different chunks of `tile_Q`, but they all index to the same `tile_K` and `tile_V` chunks in the KV-sequence-length loop.
 
-TODO: diagram of Q (left side) and KV (top side)
+{{< figure src="fa_warp_partition.svg" alt="Flash Attention warp partition" caption="Warp partition in Flash Attention 2." align="center">}}
 
 Since we are using `mma.m16n8k16` instruction, each MMA 16x8 output tile (`m16n8`) requires 16x16 A tile (`m16k16`) and 8x16 B tile (`n8k16`). `ldmatrix` can load one, two, or four 8x8 tile(s) of 16-bit elements. Hence,
 - A tile `m16k16` requires four 8x8 tiles -> `ldmatrix.x4`
