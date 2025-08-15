@@ -15,6 +15,8 @@ theme = "paper"
   name = 'Thien Tran'
   # bio = 'YOUR_BIO'
 
+  math = true
+
 [markup]
   [markup.tableOfContents]
     startLevel = 2

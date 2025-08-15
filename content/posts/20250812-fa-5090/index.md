@@ -320,6 +320,33 @@ Now, let's tackle online softmax.
 
 ### Online softmax
 
+For the original explanation, you can refer to [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867) and Flash Attention 2 paper.
+
+We have the following mathematical definition of softmax. For each row with length N
+
+$$
+p_{col} = \frac{\exp(s_{col}-m)}{\exp(s_0-m) + \exp(s_1-m) + \dots + \exp(s_{N-1}-m)}
+$$
+
+$-m$ is max subtraction to improve numerical stability ($\exp(\cdot)$ can easily explode if its input is large). Let's bring out the denominator normaliser and write the whole row as a vector.
+
+$$
+\vec P_{row} =
+\begin{bmatrix}
+p_0 \\\\
+\vdots \\\\
+p_{N-1}
+\end{bmatrix}
+= \frac{1}{\sum_{col=0}^{N-1}\exp(s_{col}-m)}
+\begin{bmatrix}
+\exp(s_0-m) \\\\
+\vdots \\\\
+\exp(s_{N-1}-m)
+\end{bmatrix}
+$$
+
+In our 2nd matmul `O += P @ V`, each row of P (softmax output) is dot-producted (sounds like improper English) corresponding columns of V.
+
 ### Pack output of 1st MMA to input of 2nd MMA
 
 ### Benchmark setup
@@ -337,5 +364,7 @@ NVIDIA's shared memory is backed by 32 memory banks. Consecutive 4-byte memory a
 ## Version 3 - 2-stage pipelining
 
 ## Version 4 - `ldmatrix.x4` for K and V
+
+Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA tile. However, since we are handling a larger tile anyway, we can directly use `ldmatrix.x4` to issue fewer instructions. The trick is to select the appropriate 8x8 tiles and compute the row addresses correctly. There are two options: load `n16k16` tile, or `n8k32` tile.
 
 ## Version 5 - better pipelining
