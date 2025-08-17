@@ -318,36 +318,175 @@ void attention_v1(
 
 Now, let's tackle online softmax.
 
-### Online softmax
+### Online softmax - theory
 
 For the original explanation, you can refer to [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867) and Flash Attention 2 paper.
 
-We have the following mathematical definition of softmax. For each row with length N
+We have the following mathematical definition of softmax. For each row with length $L_{kv}$
 
 $$
-p_{col} = \frac{\exp(s_{col}-m)}{\exp(s_0-m) + \exp(s_1-m) + \dots + \exp(s_{N-1}-m)}
+p_l = \frac{\exp(s_l-m)}{\exp(s_0-m) + \exp(s_1-m) + \dots + \exp(s_{L_{kv}-1}-m)}
+$$
+$$
+l\in[0,L_{kv})
+$$
+$$
+m=\max(s_0,s_1,\dots,s_{L_{kv}-1})
 $$
 
 $-m$ is max subtraction to improve numerical stability ($\exp(\cdot)$ can easily explode if its input is large). Let's bring out the denominator normaliser and write the whole row as a vector.
 
 $$
-\vec P_{row} =
+\vec P =
 \begin{bmatrix}
 p_0 \\\\
 \vdots \\\\
-p_{N-1}
+p_{L_{kv}-1}
 \end{bmatrix}
-= \frac{1}{\sum_{col=0}^{N-1}\exp(s_{col}-m)}
+= \frac{1}{\sum_{l\in[0,L_{kv})}\exp(s_l-m)}
 \begin{bmatrix}
 \exp(s_0-m) \\\\
 \vdots \\\\
-\exp(s_{N-1}-m)
+\exp(s_{L_{kv}-1}-m)
 \end{bmatrix}
 $$
 
-In our 2nd matmul `O += P @ V`, each row of P (softmax output) is dot-producted (sounds like improper English) corresponding columns of V.
+In our 2nd matmul `O += P @ V`, each row of P (softmax output) is dot-producted with the corresponding column of V.
 
-### Pack output of 1st MMA to input of 2nd MMA
+$$
+o=\vec P \cdot \vec V = \frac{1}{\sum_{l\in[0,L_{kv})}\exp(s_l-m)} \sum_{l\in[0,L_{kv})}\exp(s_l-m) \cdot v_l
+$$
+
+The extra dot-product is a blessing in disguise - we no longer need individual elements in a row for the final result. This enables Flash Attention to compute attention in one pass. To see it more clearly, let's consider the iterative process of adding a new element during online computation.
+
+$$
+o_{[0,L)} = \frac{1}{\sum_{l\in[0,L)}\exp(s_l-m_{[0,L)})} \sum_{l\in[0,L)}\exp(s_l-m_{[0,L)}) \cdot v_l
+$$
+$$
+m_{[0,L)}=\max(s_0,s_1,\dots,s_{L-1})
+$$
+
+I'm abusing the notation here, but I hope I get the idea across. When we add a new element $s_{L+1}$
+
+$$
+o_{[0,L+1)} = \frac{1}{\sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)})} \sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)}) \cdot v_l
+$$
+
+Look at the normaliser (denominator)
+
+$$
+\sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)}) = \colorbox{red}{$\displaystyle\exp(m_{[0,L)}-m_{[0,L+1)})$}\colorbox{orange}{$\displaystyle\sum_{l\in[0,L)}\exp(s_l-m_{[0,L)})$} + \colorbox{lime}{$\displaystyle\exp(s_L-m_{[0,L+1)})$}
+$$
+
+The equation means that we only need to $\colorbox{red}{rescale}$ the $\colorbox{orange}{previous normaliser}$ before adding the $\colorbox{lime}{new term}$. The same logic can be applied for the dot product with V (unnormalised output). **This is the key idea of online softmax and Flash Attention**.
+
+Define **attention state**
+
+$$
+\begin{bmatrix}
+m \\\\
+\tilde{o} \\\\
+\mathrm{sumexp}
+\end{bmatrix}
+$$
+
+where $m$ is max of elements seen so far, $\tilde{o}$ is **unnormalised** output, and $\mathrm{sumexp}$ is normaliser. We need $m$ to compute the rescaling factor as seen above.
+
+You can convince yourself that updating the attention state is an **associative** operation - it does not matter which elements are used to update the attention state next.
+
+$$
+\begin{bmatrix}
+m_1 \\\\
+\tilde{o}_1 \\\\
+\mathrm{sumexp}_1
+\end{bmatrix}
+\oplus \begin{bmatrix}
+m_2 \\\\
+\tilde{o}_2 \\\\
+\mathrm{sumexp}_2
+\end{bmatrix}
+= \begin{bmatrix}
+m_3 \\\\
+\tilde{o}_3 \\\\
+\mathrm{sumexp}_3
+\end{bmatrix}
+= \begin{bmatrix}
+\max(m_1,m_2) \\\\
+\exp(m_1-m_3)\tilde{o}_1+\exp(m_2-m_3)\tilde{o}_2 \\\\
+\exp(m_1-m_3)\mathrm{sumexp}_1+\exp(m_2-m_3)\mathrm{sumexp}_2
+\end{bmatrix}
+$$
+
+This associative property enables things like [Flash Decoding](https://pytorch.org/blog/flash-decoding/), a split-K version of attention.
+
+### Online softmax - Implementation
+
+We can now fill in the gap of online softmax in our high-level Python implementation.
+
+```python
+# attention state
+m = torch.zeros(BLOCK_Q)
+tile_O = torch.zeros(BLOCK_Q, DIM)
+sumexp = torch.zeros(BLOCK_Q)
+
+for _ in range(Lk // BLOCK_KV):
+  # 1st MMA
+  tile_S = tile_Q @ tile_K.T  # [BLOCK_Q, BLOCK_KV]
+  tile_S = tile_S * scale
+
+  # online softmax
+  tile_max = tile_S.amax(dim=-1)  # [BLOCK_Q]
+  new_m = torch.maximum(m, tile_max)
+  tile_P = torch.exp(tile_S - new_m.unsqueeze(-1))
+
+  # rescale
+  scale = torch.exp(m - new_m)
+  tile_O *= scale.unsqueeze(-1)
+  sumexp *= scale
+  sumexp += tile_P.sum(dim=-1)
+  m = new_m  # save new max
+
+  # 2nd MMA
+  tile_O += tile_P @ tile_V  # [BLOCK_Q, DIM]
+
+# apply normalisation
+tile_O /= sumexp.unsqueeze(-1)
+```
+
+When translating this to CUDA C++, the most tricky part is to wrap our head around MMA layout. Let's start with `tile_S`.
+
+{{< figure src="https://docs.nvidia.com/cuda/parallel-thread-execution/_images/mma-16816-C-f16.png" alt="MMA m16n8k16 output layout" caption="Thread and register layout of MMA m16n8k16 output. Source: [NVIDIA PTX doc](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float)" >}}
+
+Softmax scale applies the same scaling for all elements, so that is trivial. Next, we need to compute row max for the current tile. Remember that we allocate the registers for `tile_S` this way.
+
+```python
+float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4]
+```
+
+`4` means `c0,c1,c2,c3` in the figure above i.e. each thread holds 2 consecutive elements from 2 rows. To do reduction within a row (of an MMA output tile), we do reduction for 2 consecutive elements held by a thread, then reduction within a group of 4 threads i.e. `T0-T3`, `T4-T7`, and so on. However, the row reduction is actually within the whole `tile_S`, hence we also need to loop over `BLOCK_KV / MMA_N`. This can be combined with thread-level reduction before 4-thread-level reduction.
+
+TODO: diagram of warp tile S_rmem containing MMA tiles.
+
+```cpp
+float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
+for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+  float *regs = S_rmem[mma_id_q][mma_id_kv];
+  this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));  // c0 and c1
+  this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));  // c2 and c3
+}
+
+// butterfly reduction within 4 threads
+this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[0], 1));
+this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[0], 2));
+this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[1], 1));
+this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[1], 2));
+```
+
+In a typical reduction kernel, when there are only 32 active threads left, we can use warp shuffle [`__shfl_down_sync()`](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions) to copy data from higher lanes to lower lanes, and the final result is stored in thread 0. In this case, since we need the max value to be shared across all threads (in a group of 4), we can use `__shfl_xor_sync()` to avoid a broadcast step.
+
+TODO: figure illustrating butterfly reduction
+
+
 
 ### Benchmark setup
 
