@@ -85,9 +85,9 @@ Online softmax is quite tricky to explain, so let's delay the explanation of tha
 ## Version 1 - Basic implementation
 
 We will follow the typical MMA flow
-- Load a 2D tile of data from global memory to shared memory using [`cp.async`](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async). This requires Ampere (sm80 and above).
-- Load data from shared memory to register memory using [`ldmatrix`](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix).
-- Call [`mma.m16n8k16`](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float) for BF16 matrix multiplication (and accumulate).
+- Load a 2D tile of data from global memory to shared memory using [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async). This requires Ampere (sm80 and above).
+- Load data from shared memory to register memory using [ldmatrix](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix).
+- Call [mma.m16n8k16](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float) for BF16 matrix multiplication (and accumulate).
 
 I want to focus on implementing the algorithm correctly first, hence I leave out more complicated tricks like shared memory swizzling and pipelining. This reduces the surface area for mistakes, and we will revisit them later. I will go through these briefly since they are not the focus of this blogpost. Readers are welcome to refer to matmuls with Tensor cores articles for more detailed explanations.
 
@@ -458,7 +458,7 @@ tile_O /= sumexp.unsqueeze(-1)
 
 When translating this to CUDA C++, the most tricky part is to wrap our head around MMA layout. Let's start with `tile_S`.
 
-{{< figure src="https://docs.nvidia.com/cuda/parallel-thread-execution/_images/mma-16816-C-f16.png" alt="MMA m16n8k16 output layout" caption="Thread and register layout of MMA m16n8k16 output. Source: [NVIDIA PTX doc](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float)" >}}
+{{< figure src="https://docs.nvidia.com/cuda/parallel-thread-execution/_images/mma-16816-C-f16.png" alt="MMA m16n8k16 output layout" caption="Thread and register layout of MMA m16n8k16 output. Source: [NVIDIA PTX doc](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float)." >}}
 
 Softmax scale applies the same scaling for all elements, so that is trivial. Next, we need to compute row max for the current tile. Remember that we allocate the registers for `tile_S` this way.
 
@@ -511,9 +511,9 @@ for (int kv_idx = 0; kv_idx < num_kv_iters; kv_idx++) {
 }
 ```
 
-In a typical reduction kernel, when there are only 32 active threads left, we can use warp shuffle [`__shfl_down_sync()`](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions) to copy data from higher lanes to lower lanes, and the final result is stored in thread 0. In this case, since we need the max value to be shared among the 4 threads in a group (for max subtraction later), we can use `__shfl_xor_sync()` to avoid an additional broadcast step.
+In a typical reduction kernel, when there are only 32 active threads left, we can use warp shuffle [__shfl_down_sync()](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions) to copy data from higher lanes to lower lanes, and the final result is stored in thread 0. In this case, since we need the max value to be shared among the 4 threads in a group (for max subtraction later), we can use `__shfl_xor_sync()` to avoid an additional broadcast step.
 
-{{< figure src="butterfly_reduction.svg" alt="Butterfly reduction" caption="Butterfly reduction within 4 threads using `__shfl_xor_sync()`." >}}
+{{< figure src="butterfly_reduction.svg" alt="Butterfly reduction" caption="Butterfly reduction within 4 threads using __shfl_xor_sync()." >}}
 
 #### Rescaling
 
@@ -540,7 +540,7 @@ rowmax[mma_id_q][0] = this_rowmax[0];
 rowmax[mma_id_q][1] = this_rowmax[1];
 ```
 
-We don't rescale `rowsumexp` here because we want to fuse it with addition of the new sumexp term later i.e. FMA - fused multiply add. We can't fuse multiplication with MMA, hence we need to do a separate multiplication for `O_rmem[][]`.
+We don't rescale `rowsumexp` here because we want to fuse it with addition of the new sumexp term later i.e. FMA - fused multiply add. We can't fuse multiplication with MMA, hence we need to do a separate multiplication for `O_rmem`.
 
 #### Pack `tile_S` to `tile_P` (and row sum exp)
 
@@ -553,9 +553,9 @@ uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];  // m16k16
 
 Look up the thread/register layout for MMA multiplicand A and output C/D again in PTX docs. Luckily, the layouts are exactly the same - within an 8x8 tile, the arrangement of elements is identical.
 
-TODO: diagram that maps C/D layout to A layout.
+{{< figure src="m16n8_to_m16k16.svg" alt="Register layout of MMA m16n8k16" caption="The left half of multiplicand A has the same layout as accumulator. Source: [NVIDIA PTX doc](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float)." >}}
 
-It means that for all threads, every 2 floats in `S_rmem` can be packed as BF16x2 in a single 32-bit register of `P_rmem`, exactly how `mma.m16n8k16` expects for the 2nd MMA. There are no data movements across threads in this case. Note that this is not always true: if we use INT8 or FP8 MMA for the 1st and/or 2nd MMA, we would need to permute data across threads to pack `tile_S` to `tile_P`.
+It means that for all threads, every 2 floats in `S_rmem` can be packed as BF16x2 in a single 32-bit register of `P_rmem`, exactly how `mma.m16n8k16` expects for the 2nd MMA. There are no data movements across threads. Note that this is not always true: if we use INT8 or FP8 MMA for the 1st and/or 2nd MMA, we would need to permute data across threads to pack `tile_S` to `tile_P`.
 
 Our code for the last part of online softmax is below.
 
@@ -574,9 +574,10 @@ for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
 
   // pack to P registers for next MMA
   // we need to change from m16n8 to m16k16
+  // each iteration of this loop packs half of m16k16
   nv_bfloat162 *this_P_rmem = reinterpret_cast<nv_bfloat162 *>(P_rmem[mma_id_q][mma_id_kv / 2]);
-  this_P_rmem[(mma_id_kv % 2) * 2]     = __float22bfloat162_rn({regs[0], regs[1]});
-  this_P_rmem[(mma_id_kv % 2) * 2 + 1] = __float22bfloat162_rn({regs[2], regs[3]});
+  this_P_rmem[(mma_id_kv % 2) * 2]     = __float22bfloat162_rn({regs[0], regs[1]});  // top row
+  this_P_rmem[(mma_id_kv % 2) * 2 + 1] = __float22bfloat162_rn({regs[2], regs[3]});  // bottom row
 }
 
 // butterfly reduction on this_rowsumexp[2]
@@ -587,27 +588,71 @@ rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0]
 rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
 ```
 
-After this is the 2nd MMA: load V, then compute `tile_O += tile_P @ tile_V`. This completes our 1st version of Flash Attention. Actually we also need to normalise the output before writing `O_rmem` to global memory, but that part should be pretty straight-forward.
+After this is the 2nd MMA: load V, then compute `tile_O += tile_P @ tile_V`. This completes our 1st version of Flash Attention. Actually we also need to normalise the output before writing `O_rmem` to global memory, but the logic for that should be pretty straightforward.
 
 You can find the full code for the 1st version at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v1.cu).
 
 ### Benchmark setup
 
-Wow, that's plentiful for the 1st version. Indeed, I spent the most time on version 1 trying to implement Flash Attention correctly. Took me 2 days to realize [`__shfl_xor_sync()`'s mask should be 2 (`0b10`) instead of `0x10` for butterfly reduction](https://github.com/gau-nernst/learn-cuda/commit/8fdb3e6a).
+Wow, that's plentiful for the 1st version. Indeed, I spent the most time on version 1 trying to implement Flash Attention correctly. Took me 2 days to realize [__shfl_xor_sync()'s mask should be 2 (0b10) instead of 0x10 for butterfly reduction](https://github.com/gau-nernst/learn-cuda/commit/8fdb3e6a).
 
-TODO: PyTorch benchmark. Correctness check
+Anyway, now we need a script for correctness check as well as speed benchmark. I prefer to do these things in Python Pytorch since it's easy to do, as well as making it simple to compare against other attention kernels with PyTorch bindings. To achieve this, I create:
+1. [attention.cpp](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention.cpp): provides PyTorch bindings for my attention kernels.
+2. [main.py](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/main.py): correctness check and speed benchmark.
 
-That's fine, we still have a few tricks up our sleeves for the next few versions.
+For the random inputs, I purposely add a small bias to the standard normal distribution so that the output has a positive mean. This is to avoid large relative error caused by zero mean.
+
+```python
+def generate_input(*shape):
+    return torch.randn(shape).add(0.5).bfloat16().cuda()
+```
+
+The reference implementation is `F.sdpa()`, which should dispatch Flash Attention 2 by default. For speed benchmarks, I compare against FA2 and CuDNN backends of `F.sdpa()`, as well as FA2 from [flash-attn](https://github.com/Dao-AILab/flash-attention) package. I did do some tuning of `BLOCK_Q` and `BLOCK_KV`, and obtained the following results.
+
+Kernel                         | TFLOPS | % of SOL
+-------------------------------|--------|---------
+`F.sdpa()` (Flash Attention)   | 186.73 | 89.13%
+`F.sdpa()` (CuDNN)             | 203.61 | 97.19%
+`flash-attn`                   | 190.58 | 90.97%
+v1 (basic)                     | 142.87 | 68.20%
+
+It doesn't look too bad for the first version, but we still have some headroom to go. That's fine, because we still have a few tricks up our sleeves for the next versions. In fact, the tricks are exactly the same as the ones used in optimizing a matmul kernel.
+
+#### Profiling
+
+Before moving to the next version, I want to talk about profiling tools. I think it's always a good idea to use profiling as the guide for optimization. Previously I only knew how to use [ncu](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html) at a very basic level. Seeing so many people using [Nsight Compute](https://developer.nvidia.com/nsight-compute) with cool diagrams, I decided to learn how to use it, and it was actually quite easy to use.
+
+Nsight Compute can run on a macOS machine with SSH access to another machine with NVIDIA GPU, which is exactly the setup I'm using right now (yes, I write code exclusively on my Macbook...). If you are unfamiliar with Nsight Compute, I recommend watching a tutorial or two to get acquainted with it.
+
+To enable source inspection feature, remember to pass `-lineinfo` to NVCC (see [here](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/main.py#L22)), and enable "Import Source" in Nsight Compute.
 
 ## Version 2 - Shared memory swizzling
 
-Nsight. Stall short scoreboard -> shared memory. ...
+Let's do a profiling with Nsight Compute, and look at Warp State Statistics section.
+
+{{< figure src="v1_warp_state_stats.png" alt="Warp state statistics of version 1" caption="Warp state statistics of kernel version 1." >}}
+
+"Stall Math Pipe Throttle" being the highest is good - it means warps are busy with math operations i.e. Tensor Cores. The second highest is "Stall Short Scoreboard". This typically means waiting for accesses to and from shared memory. You can go to [Nsight Compute doc](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html) and search for `stalled_short_scoreboard`.
+
+We can double confirm this by looking at "Memory Workload Analysis", which reveals several problems.
+
+{{< figure src="v1_memory_analysis.png" alt="Memory analsysis of version 1" caption="Memory analysis of kernel version 1." >}}
+
+- **L1TEX Global Store Access Pattern** comes from storing the output, since it is the only global write we have. This is not important since the runtime of looping over the sequence length of KV should dominate when `len_kv` is large.
+- **L1TEX Local Load/Store Access Pattern** is due to register spilling. Since it's register spilling, only spill and reload 1 element at a time is normal. Reducing `BLOCK_Q` (so that we use fewer registers to hold accumulators) would resolve this issue, but my manual tuning showed that some spilling was actually faster.
+- **Shared Load Bank Conflicts** is exactly what we are looking for - bank conflicts that result in "Stall Short Scoreboard".
 
 NVIDIA's shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared memory to register memory with `ldmatrix` -
 
+TODO: figure showing memory banks for 8x32
+
+There are 2 standard solutions to this problem
+1. **Pad shared memory**. Due to `ldmatrix`'s alignment requirement, we can only pad the width with 16 bytes, equivalent to 4 banks. This means that when we go to the next row, the memory banks are shifted by 4, avoiding bank conflicts. In many cases, this is good enough. However, it's generally quite wasteful as we are not utilising the padded storage.
+2. **Swizzle shared memory address**. This is black magic: you XOR the shared memory address with some magic numbers, then suddenly bank conflicts disappear!
+
 ## Version 3 - 2-stage pipelining
 
-## Version 4 - `ldmatrix.x4` for K and V
+## Version 4 - ldmatrix.x4 for K and V
 
 Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA tile. However, since we are handling a larger tile anyway, we can directly use `ldmatrix.x4` to issue fewer instructions. The trick is to select the appropriate 8x8 tiles and compute the row addresses correctly. There are two options: load `n16k16` tile, or `n8k32` tile.
 
