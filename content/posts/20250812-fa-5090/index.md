@@ -453,14 +453,16 @@ for _ in range(Lk // BLOCK_KV):
 tile_O /= sumexp.unsqueeze(-1)
 ```
 
+#### Row max
+
 When translating this to CUDA C++, the most tricky part is to wrap our head around MMA layout. Let's start with `tile_S`.
 
 {{< figure src="https://docs.nvidia.com/cuda/parallel-thread-execution/_images/mma-16816-C-f16.png" alt="MMA m16n8k16 output layout" caption="Thread and register layout of MMA m16n8k16 output. Source: [NVIDIA PTX doc](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float)" >}}
 
 Softmax scale applies the same scaling for all elements, so that is trivial. Next, we need to compute row max for the current tile. Remember that we allocate the registers for `tile_S` this way.
 
-```python
-float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4]
+```cpp
+float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4];
 ```
 
 `4` means `c0,c1,c2,c3` in the figure above i.e. each thread holds 2 consecutive elements from 2 rows. To do reduction within a row (of an MMA output tile), we do reduction for 2 consecutive elements held by a thread, then reduction within a group of 4 threads i.e. `T0-T3`, `T4-T7`, and so on. However, the row reduction is actually within the whole `tile_S`, hence we also need to loop over `BLOCK_KV / MMA_N`. This can be combined with thread-level reduction before 4-thread-level reduction.
@@ -468,37 +470,139 @@ float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4]
 TODO: diagram of warp tile S_rmem containing MMA tiles.
 
 ```cpp
-float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
-for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
-  float *regs = S_rmem[mma_id_q][mma_id_kv];
-  this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));  // c0 and c1
-  this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));  // c2 and c3
+// initial attention state
+float rowmax[WARP_Q / MMA_M][2];
+float rowsumexp[WARP_Q / MMA_M][2] = {};
+for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+  rowmax[mma_id_q][0] = -FLT_MAX;
+  rowmax[mma_id_q][1] = -FLT_MAX;
 }
 
-// butterfly reduction within 4 threads
-this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[0], 1));
-this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[0], 2));
-this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[1], 1));
-this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[1], 2));
+// main loop
+const int num_kv_iters = len_kv / BLOCK_KV;
+for (int kv_idx = 0; kv_idx < num_kv_iters; kv_idx++) {
+  // tile_S = tile_Q @ tile_K.T
+  S_rmem[][] = ...
+
+  // loop over rows
+  for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++) {
+    // apply softmax scale
+    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+      for (int reg_id = 0; reg_id < 4; reg_id++)
+        S_rmem[mma_id_q][mma_id_kv][reg_id] *= softmax_scale;
+
+    // rowmax
+    float this_rowmax[2] = {-FLT_MAX, -FLT_MAX};
+    for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+      float *regs = S_rmem[mma_id_q][mma_id_kv];
+      this_rowmax[0] = max(this_rowmax[0], max(regs[0], regs[1]));  // c0 and c1
+      this_rowmax[1] = max(this_rowmax[1], max(regs[2], regs[3]));  // c2 and c3
+    }
+
+    // butterfly reduction within 4 threads
+    this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[0], 1));
+    this_rowmax[0] = max(this_rowmax[0], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[0], 2));
+    this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[1], 1));
+    this_rowmax[1] = max(this_rowmax[1], __shfl_xor_sync(0xFFFF'FFFF, this_rowmax[1], 2));
+  }
+
+  ...
+}
 ```
 
 In a typical reduction kernel, when there are only 32 active threads left, we can use warp shuffle [`__shfl_down_sync()`](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions) to copy data from higher lanes to lower lanes, and the final result is stored in thread 0. In this case, since we need the max value to be shared across all threads (in a group of 4), we can use `__shfl_xor_sync()` to avoid a broadcast step.
 
 TODO: figure illustrating butterfly reduction
 
+#### Rescaling
 
+With row max of the new tile, we can compute rescaling factor for (unnormalised) output as well as normaliser (sumexp of each row).
+
+```cpp
+// new rowmax
+this_rowmax[0] = max(this_rowmax[0], rowmax[mma_id_q][0]);
+this_rowmax[1] = max(this_rowmax[1], rowmax[mma_id_q][1]);
+
+// rescale for previous O
+float rescale[2];
+rescale[0] = __expf(rowmax[mma_id_q][0] - this_rowmax[0]);
+rescale[1] = __expf(rowmax[mma_id_q][1] - this_rowmax[1]);
+for (int mma_id_d = 0; mma_id_d < DIM / MMA_N; mma_id_d++) {
+  O_rmem[mma_id_q][mma_id_d][0] *= rescale[0];
+  O_rmem[mma_id_q][mma_id_d][1] *= rescale[0];
+  O_rmem[mma_id_q][mma_id_d][2] *= rescale[1];
+  O_rmem[mma_id_q][mma_id_d][3] *= rescale[1];
+}
+
+// save new rowmax
+rowmax[mma_id_q][0] = this_rowmax[0];
+rowmax[mma_id_q][1] = this_rowmax[1];
+```
+
+We don't rescale `rowsumexp` here because we want to fuse it with addition of the new sumexp term later i.e. FMA - fused multiply add. We can't fuse multiplication with MMA, hence we need to do a single multiplication for `O_rmem[][]`.
+
+#### Pack `tile_S` to `tile_P` (and row sum exp)
+
+For the next part, we will loop over the row dimension again (`BLOCK_KV / MMA_N`), to compute and pack `tile_P` from `tile_S`, as well as doing reduction for sumexp. Recall that we declare registers for `S` and `P` as follows.
+
+```cpp
+float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4]      // m16n8
+uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];  // m16k16
+```
+
+Look up the thread/register layout for MMA multiplicand A and output C/D again in PTX docs. Luckily, the layouts are exactly the same - within an 8x8 tile, the arrangement of elements is identical.
+
+TODO: diagram that maps C/D layout to A layout.
+
+It means that for all threads, every 2 floats in `S_rmem` can be packed as BF16x2 in a single 32-bit register of `P_rmem`, exactly how `mma.m16n8k16` expects for the 2nd MMA. There are no data movements across threads in this case. Note that this is not always true: if we use INT8 or FP8 MMA for the 1st and/or 2nd MMA, we would need to permute data across threads to pack `tile_S` to `tile_P`.
+
+Our code for the last part of online softmax is below.
+
+```cpp
+// rowsumexp
+float this_rowsumexp[2] = {};
+for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++) {
+  float *regs = S_rmem[mma_id_q][mma_id_kv];
+  regs[0] = __expf(regs[0] - rowmax[mma_id_q][0]);  // c0
+  regs[1] = __expf(regs[1] - rowmax[mma_id_q][0]);  // c1
+  regs[2] = __expf(regs[2] - rowmax[mma_id_q][1]);  // c2
+  regs[3] = __expf(regs[3] - rowmax[mma_id_q][1]);  // c3
+
+  this_rowsumexp[0] += regs[0] + regs[1];
+  this_rowsumexp[1] += regs[2] + regs[3];
+
+  // pack to P registers for next MMA
+  // we need to change from m16n8 to m16k16
+  nv_bfloat162 *this_P_rmem = reinterpret_cast<nv_bfloat162 *>(P_rmem[mma_id_q][mma_id_kv / 2]);
+  this_P_rmem[(mma_id_kv % 2) * 2]     = __float22bfloat162_rn({regs[0], regs[1]});
+  this_P_rmem[(mma_id_kv % 2) * 2 + 1] = __float22bfloat162_rn({regs[2], regs[3]});
+}
+
+// butterfly reduction on this_rowsumexp[2]
+...
+
+// accumulate to total rowsumexp using FMA
+rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0];
+rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
+```
+
+After this is the 2nd MMA: load V, then compute `tile_O += tile_P @ tile_V`. This completes our 1st version of Flash Attention. Actually we also need to normalise the output before writing `O_rmem` to global memory, but that part should be pretty straight-forward.
+
+You can find the full code for the 1st version at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention/attention_v1.cu).
 
 ### Benchmark setup
 
 Wow, that's plentiful for the 1st version. Indeed, I spent the most time on version 1 trying to implement Flash Attention correctly. Took me 2 days to realize [`__shfl_xor_sync()`'s mask should be 2 (`0b10`) instead of `0x10` for butterfly reduction](https://github.com/gau-nernst/learn-cuda/commit/8fdb3e6a95a18502c2250571eeeb2179860936c0).
 
-That's fine, we still have a few tricks up our sleeves for the next few versions
+TODO: PyTorch benchmark. Correctness check
+
+That's fine, we still have a few tricks up our sleeves for the next few versions.
 
 ## Version 2 - Shared memory swizzling
 
 Nsight. Stall short scoreboard -> shared memory. ...
 
-NVIDIA's shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared memory to register memory with `ldmatrix` - 
+NVIDIA's shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared memory to register memory with `ldmatrix` -
 
 ## Version 3 - 2-stage pipelining
 
