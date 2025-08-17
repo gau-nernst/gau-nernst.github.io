@@ -8,7 +8,7 @@ In this post, I will walkthrough how I learned to implement Flash Attention for 
 
 Readers are highly recommended to be familiar with CUDA C++ and how to use Tensor cores on NVIDIA GPUs. Of course you can still read along and clarify with your favourite LLMs along the way. Or you can check out GPU-MODE series ([slides](https://github.com/gpu-mode/lectures), [YouTube](https://www.youtube.com/@GPUMODE)) for basic CUDA C++ knowledge, as well as the excellent matmul blogposts mentioned above, to quickly get up to speed.
 
-You can find the full implementation discussed in this post here: https://github.com/gau-nernst/learn-cuda/tree/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention. For `bs=1, num_heads=8, len_query=4096, len_kv = 8192`, 5090 @ 400W, compile with CUDA 12.9, I obtained the following benchmark results (theoretical limit of 5090 is 209.5 TFLOPS for BF16)
+You can find the full implementation discussed in this post here: https://github.com/gau-nernst/learn-cuda/tree/e83c256/07_attention. For `bs=1, num_heads=8, len_query=4096, len_kv = 8192`, 5090 @ 400W, compile with CUDA 12.9, I obtained the following benchmark results (theoretical limit of 5090 is 209.5 TFLOPS for BF16)
 
 Kernel                         | TFLOPS | % of SOL
 -------------------------------|--------|---------
@@ -132,7 +132,7 @@ Note:
 
 ### Shared memory to Register memory data transfer
 
-When doing global->shared data transfer, we think in terms of threadblock tiles and individual CUDA threads. For shared->register data transfer, since this is to service the later MMA instruction, we think in terms of warp/MMA tiles and warps. Following Flash Attention 2 (section 3.3), we let each warp in a threadblock handle a portion of `tile_Q`, splitting along the Q sequence length dimension. This means that different warps will index into different chunks of `tile_Q`, but they all index to the same `tile_K` and `tile_V` chunks in the KV-sequence-length loop.
+When doing global->shared data transfer, we think in terms of threadblock tiles and individual CUDA threads. For shared->register data transfer, since this is to service later MMA instructions, we think in terms of warp tiles/MMA tiles and warps. Following Flash Attention 2 (section 3.3), we let each warp in a threadblock handle a portion of `tile_Q`, splitting along the Q sequence length dimension. This means that different warps will index into different chunks of `tile_Q`, but they all index to the same `tile_K` and `tile_V` chunks in the KV-sequence-length loop.
 
 {{< figure src="fa_warp_partition.svg" alt="Flash Attention warp partition" caption="Warp partition in Flash Attention 2." align="center">}}
 
@@ -142,7 +142,7 @@ Since we are using `mma.m16n8k16` instruction, each MMA 16x8 output tile (`m16n8
 
 Only Q acts as A in an MMA. Both K and V act as B in their MMAs, though K will require transposed `ldmatrix` for correct layout (all tensors use row-major layout in global and shared memory).
 
-To use `ldmatrix`, each thread supplies the address of each row. Threads 0-7 select the 1st 8x8 tile, threads 8-15 select the 2nd 8x8 tile, and so on. The [layout of A](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float) in the official PTX documentation can look confusing. But it's easier (at least for me) to focus on the order of 8x8 tiles.
+To use `ldmatrix`, each thread supplies address of a row. Threads 0-7 select the 1st 8x8 tile, threads 8-15 select the 2nd 8x8 tile, and so on. The [layout of A](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float) in the official PTX documentation can look confusing. But it's easier (at least for me) to focus on the order of 8x8 tiles within an MMA tile.
 
 {{< figure src="ldmatrix.svg" alt="ldmatrix for MMA layout" caption="Order of `ldmatrix` tiles in `mma.m16n8k16`." align="center">}}
 
@@ -170,11 +170,13 @@ for (int mma_id_q = 0; mma_id_q < WARP_Q / MMA_M; mma_id_q++)
 - `(mma_id_q * MMA_M)` in `row` and `(mma_id_d * MMA_K)` in `col` selects the MMA tile.
 - `(lane_id % 16)` in `row` and `(lane_id / 16 * 8)` in `col` select the correct row address for each thread, following the required Multiplicand A layout (see the figure above).
 
-`ldmatrix_x4()` is a small wrapper around `ldmatrix.sync.aligned.m8n8.x4.b16` PTX for convenience. You can refer to [common.h](https://github.com/gau-nernst/learn-cuda/blob/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention/common.h) for more details.
+`ldmatrix_x4()` is a small wrapper around `ldmatrix.sync.aligned.m8n8.x4.b16` PTX for convenience. You can refer to [common.h](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/common.h) for more details.
 
 K and V can be loaded from shared to register memory similarly. One thing to note is about the row-major / column-major layout when using `ldmatrix`. Regardless of whether `.trans` modifier is used, each thread still provides the row address of each row in 8x8 tiles. `.trans` only changes the **register layout** of `ldmatrix` results.
 
-TOOD: add a figure here.
+{{< figure src="ldmatrix_kv.svg" alt="ldmatrix for K and V" caption="Use transposed version of `ldmatrix` for V." align="center">}}
+
+One trick to know whether to use the transposed version of `ldmatrix` is to look at the K-dim or the reduction dimension. The 1st MMA's K-dim is along `DIM` dimension, while the 2nd MMA's K-dim is along the `BLOCK_KV` dimension.
 
 ### Draft version
 
@@ -270,7 +272,7 @@ void attention_v1_kernel(
     // similar to loading K, except we use ldmatrix_x2_trans()
     ...
 
-    // 2nd MMA: O = P @ V
+    // 2nd MMA: O += P @ V
     // similar to the 1st MMA
     ...
 
@@ -318,7 +320,7 @@ void attention_v1(
 
 Now, let's tackle online softmax.
 
-### Online softmax - theory
+### Online softmax - Theory
 
 For the original explanation, you can refer to [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867) and Flash Attention 2 paper.
 
@@ -392,7 +394,7 @@ $$
 
 where $m$ is max of elements seen so far, $\tilde{o}$ is **unnormalised** output, and $\mathrm{sumexp}$ is normaliser. We need $m$ to compute the rescaling factor as seen above.
 
-You can convince yourself that updating the attention state is an **associative** operation - it does not matter which elements are used to update the attention state next.
+You can convince yourself that updating attention state is an **associative** operation - it does not matter the order in which elements are used to update the attention state.
 
 $$
 \begin{bmatrix}
@@ -442,8 +444,7 @@ for _ in range(Lk // BLOCK_KV):
   # rescale
   scale = torch.exp(m - new_m)
   tile_O *= scale.unsqueeze(-1)
-  sumexp *= scale
-  sumexp += tile_P.sum(dim=-1)
+  sumexp = sumexp * scale + tile_P.sum(dim=-1)
   m = new_m  # save new max
 
   # 2nd MMA
@@ -465,9 +466,9 @@ Softmax scale applies the same scaling for all elements, so that is trivial. Nex
 float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4];
 ```
 
-`4` means `c0,c1,c2,c3` in the figure above i.e. each thread holds 2 consecutive elements from 2 rows. To do reduction within a row (of an MMA output tile), we do reduction for 2 consecutive elements held by a thread, then reduction within a group of 4 threads i.e. `T0-T3`, `T4-T7`, and so on. However, the row reduction is actually within the whole `tile_S`, hence we also need to loop over `BLOCK_KV / MMA_N`. This can be combined with thread-level reduction before 4-thread-level reduction.
+`4` means `c0,c1,c2,c3` in the figure above i.e. each thread holds 2 consecutive elements from 2 rows. To do reduction within a row (of an MMA output tile), we do reduction for 2 consecutive elements held by a thread, then reduction within a group of 4 threads i.e. `T0-T3`, `T4-T7`, and so on. However, the row reduction is actually within the whole `tile_S`, hence we also need to loop over `BLOCK_KV / MMA_N` of `S_rmem`. This can be combined with thread-level reduction before 4-thread reduction.
 
-TODO: diagram of warp tile S_rmem containing MMA tiles.
+{{< figure src="row_reduction.svg" alt="Row reduction" caption="Perform row reduction on MMA output." >}}
 
 ```cpp
 // initial attention state
@@ -510,9 +511,9 @@ for (int kv_idx = 0; kv_idx < num_kv_iters; kv_idx++) {
 }
 ```
 
-In a typical reduction kernel, when there are only 32 active threads left, we can use warp shuffle [`__shfl_down_sync()`](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions) to copy data from higher lanes to lower lanes, and the final result is stored in thread 0. In this case, since we need the max value to be shared across all threads (in a group of 4), we can use `__shfl_xor_sync()` to avoid a broadcast step.
+In a typical reduction kernel, when there are only 32 active threads left, we can use warp shuffle [`__shfl_down_sync()`](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions) to copy data from higher lanes to lower lanes, and the final result is stored in thread 0. In this case, since we need the max value to be shared among the 4 threads in a group (for max subtraction later), we can use `__shfl_xor_sync()` to avoid an additional broadcast step.
 
-TODO: figure illustrating butterfly reduction
+{{< figure src="butterfly_reduction.svg" alt="Butterfly reduction" caption="Butterfly reduction within 4 threads using `__shfl_xor_sync()`." >}}
 
 #### Rescaling
 
@@ -539,7 +540,7 @@ rowmax[mma_id_q][0] = this_rowmax[0];
 rowmax[mma_id_q][1] = this_rowmax[1];
 ```
 
-We don't rescale `rowsumexp` here because we want to fuse it with addition of the new sumexp term later i.e. FMA - fused multiply add. We can't fuse multiplication with MMA, hence we need to do a single multiplication for `O_rmem[][]`.
+We don't rescale `rowsumexp` here because we want to fuse it with addition of the new sumexp term later i.e. FMA - fused multiply add. We can't fuse multiplication with MMA, hence we need to do a separate multiplication for `O_rmem[][]`.
 
 #### Pack `tile_S` to `tile_P` (and row sum exp)
 
@@ -588,11 +589,11 @@ rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1]
 
 After this is the 2nd MMA: load V, then compute `tile_O += tile_P @ tile_V`. This completes our 1st version of Flash Attention. Actually we also need to normalise the output before writing `O_rmem` to global memory, but that part should be pretty straight-forward.
 
-You can find the full code for the 1st version at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/7e2d6951c3fb2b0211dca756fb2144126a352013/07_attention/attention_v1.cu).
+You can find the full code for the 1st version at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v1.cu).
 
 ### Benchmark setup
 
-Wow, that's plentiful for the 1st version. Indeed, I spent the most time on version 1 trying to implement Flash Attention correctly. Took me 2 days to realize [`__shfl_xor_sync()`'s mask should be 2 (`0b10`) instead of `0x10` for butterfly reduction](https://github.com/gau-nernst/learn-cuda/commit/8fdb3e6a95a18502c2250571eeeb2179860936c0).
+Wow, that's plentiful for the 1st version. Indeed, I spent the most time on version 1 trying to implement Flash Attention correctly. Took me 2 days to realize [`__shfl_xor_sync()`'s mask should be 2 (`0b10`) instead of `0x10` for butterfly reduction](https://github.com/gau-nernst/learn-cuda/commit/8fdb3e6a).
 
 TODO: PyTorch benchmark. Correctness check
 
