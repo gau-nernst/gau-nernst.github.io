@@ -632,17 +632,19 @@ Let's do a profiling with Nsight Compute, and look at Warp State Statistics sect
 
 {{< figure src="v1_warp_state_stats.png" alt="Warp state statistics of version 1" caption="Warp state statistics of kernel version 1." >}}
 
-"Stall Math Pipe Throttle" being the highest is good - it means warps are busy with math operations i.e. Tensor Cores. The second highest is "Stall Short Scoreboard". This typically means waiting for accesses to and from shared memory. You can go to [Nsight Compute doc](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html) and search for `stalled_short_scoreboard`.
+**Stall Math Pipe Throttle** being the highest is good - it means warps are busy with math operations i.e. Tensor Cores. The second highest is **Stall Short Scoreboard**. This typically means waiting for accesses to and from shared memory. You can check [Nsight Compute doc](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html) and search for `stalled_short_scoreboard`.
 
 We can double confirm this by looking at "Memory Workload Analysis", which reveals several problems.
 
 {{< figure src="v1_memory_analysis.png" alt="Memory analsysis of version 1" caption="Memory analysis of kernel version 1." >}}
 
 - **L1TEX Global Store Access Pattern** comes from storing the output, since it is the only global write we have. This is not important since the runtime of looping over the sequence length of KV should dominate when `len_kv` is large.
-- **L1TEX Local Load/Store Access Pattern** is due to register spilling. Since it's register spilling, only spill and reload 1 element at a time is normal. Reducing `BLOCK_Q` (so that we use fewer registers to hold accumulators) would resolve this issue, but my manual tuning showed that some spilling was actually faster.
+- **L1TEX Local Load/Store Access Pattern** is due to register spilling. Since it's register spilling, only spilling and reloading 1 element at a time is normal. Reducing `BLOCK_Q` (so that we use fewer registers to hold accumulators) would resolve this issue, but my manual tuning showed that some spilling was actually faster.
 - **Shared Load Bank Conflicts** is exactly what we are looking for - bank conflicts that result in "Stall Short Scoreboard".
 
-NVIDIA's shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared memory to register memory with `ldmatrix` -
+NVIDIA GPU's shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared memory to register memory with `ldmatrix`
+
+Although it's not explitcitly stated in any documentations, `ldmatrix.x2` and `ldmatrix.x4` operate per 8x8 tile at a time. This is good, since it makes our analysis simpler: we only need to consider the case of loading a 8x8 tile.
 
 TODO: figure showing memory banks for 8x32
 
@@ -650,10 +652,46 @@ There are 2 standard solutions to this problem
 1. **Pad shared memory**. Due to `ldmatrix`'s alignment requirement, we can only pad the width with 16 bytes, equivalent to 4 banks. This means that when we go to the next row, the memory banks are shifted by 4, avoiding bank conflicts. In many cases, this is good enough. However, it's generally quite wasteful as we are not utilising the padded storage.
 2. **Swizzle shared memory address**. This is black magic: you XOR the shared memory address with some magic numbers, then suddenly bank conflicts disappear!
 
+Since this is a standard optimization in matmul kernels, I also added a small optimization for `ldmatrix`. I pre-compute row addresses and swizzling outside of the main loop, so that there is less work in the hot loop. Notice that swizzling is a XOR operation - we cannot exchange XOR with addition i.e. `(a + b) ^ c != (a ^ c) + b`. However, notice that if there is some alignment in the base address `a`, addition becomes XOR! i.e. `100 + 001 == 100 ^ 001`. Hence, when incrementing the input address of `ldmatrix`, we XOR it with row offset, instead of doing addition.
+
 ## Version 3 - 2-stage pipelining
+
+One neat coding style that I have learned from [Mingfei Ma](https://github.com/mingfeima), a maintainer of PyTorch CPU backend, is to use [lambda expression](https://en.cppreference.com/w/cpp/language/lambda.html) to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same function multiple times.
 
 ## Version 4 - ldmatrix.x4 for K and V
 
 Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA tile. However, since we are handling a larger tile anyway, we can directly use `ldmatrix.x4` to issue fewer instructions. The trick is to select the appropriate 8x8 tiles and compute the row addresses correctly. There are two options: load `n16k16` tile, or `n8k32` tile.
 
 ## Version 5 - better pipelining
+
+In version 3, we use double buffers for both K and V. However, this is redundant: while doing the 1st MMA, we can prefect V for the current iteration; while doing the 2nd MMA, we can prefetch K for the next iteration. In other words, we only need double buffers for K.
+
+
+```cpp
+// prefetch K
+load_K(0);
+
+for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
+  // prefetch V for current iteration
+  __syncthreads();
+  load_V(kv_id);
+
+  // K smem->rmem
+  asm volatile("cp.async.wait_group 1;");
+  __syncthreads();
+  ...
+
+  // 1st MMA
+  ...
+
+  // prefetch K for the next iteration
+  load_K(kv_id + 1);
+
+  // online softmax and 2nd MMA
+  ...
+}
+```
+
+Using shared memory more efficiently means we can increase some tile sizes. The improvement is modest but noticeable.
+
+## What's next?
