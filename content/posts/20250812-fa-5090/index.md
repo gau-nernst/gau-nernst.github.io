@@ -392,11 +392,12 @@ m \\\\
 \end{bmatrix}
 $$
 
-where $m$ is max of elements seen so far, $\tilde{o}$ is **unnormalised** output, and $\mathrm{sumexp}$ is normaliser. We need $m$ to compute the rescaling factor as seen above.
+where $m$ is the max of elements seen so far, $\tilde{o}$ is the **unnormalised** output, and $\mathrm{sumexp}$ is the normaliser. We need $m$ to compute the rescaling factor as seen above.
 
 You can convince yourself that updating attention state is an **associative** operation - it does not matter the order in which elements are used to update the attention state.
 
 $$
+\begin{aligned}
 \begin{bmatrix}
 m_1 \\\\
 \tilde{o}_1 \\\\
@@ -407,16 +408,17 @@ m_2 \\\\
 \tilde{o}_2 \\\\
 \mathrm{sumexp}_2
 \end{bmatrix}
-= \begin{bmatrix}
+&= \begin{bmatrix}
 m_3 \\\\
 \tilde{o}_3 \\\\
 \mathrm{sumexp}_3
-\end{bmatrix}
-= \begin{bmatrix}
+\end{bmatrix} \\\\
+&= \begin{bmatrix}
 \max(m_1,m_2) \\\\
 \exp(m_1-m_3)\tilde{o}_1+\exp(m_2-m_3)\tilde{o}_2 \\\\
 \exp(m_1-m_3)\mathrm{sumexp}_1+\exp(m_2-m_3)\mathrm{sumexp}_2
 \end{bmatrix}
+\end{aligned}
 $$
 
 This associative property enables things like [Flash Decoding](https://pytorch.org/blog/flash-decoding/), a split-K version of attention.
@@ -590,7 +592,7 @@ rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1]
 
 After this is the 2nd MMA: load V, then compute `tile_O += tile_P @ tile_V`. This completes our 1st version of Flash Attention. Actually we also need to normalise the output before writing `O_rmem` to global memory, but the logic for that should be pretty straightforward.
 
-You can find the full code for the 1st version at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v1.cu).
+You can find the full code for the Version 1 at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v1.cu).
 
 ### Benchmark setup
 
@@ -642,30 +644,89 @@ We can double confirm this by looking at "Memory Workload Analysis", which revea
 - **L1TEX Local Load/Store Access Pattern** is due to register spilling. Since it's register spilling, only spilling and reloading 1 element at a time is normal. Reducing `BLOCK_Q` (so that we use fewer registers to hold accumulators) would resolve this issue, but my manual tuning showed that some spilling was actually faster.
 - **Shared Load Bank Conflicts** is exactly what we are looking for - bank conflicts that result in "Stall Short Scoreboard".
 
-NVIDIA GPU's shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared memory to register memory with `ldmatrix`
+NVIDIA GPU's shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared to register memory with `ldmatrix`. Although it's not explitcitly stated in any documentations, `ldmatrix.x2` and `ldmatrix.x4` operate per 8x8 tile at a time. This is good, since it makes our analysis simpler: we only need to consider the case of loading a 8x8 tile.
 
-Although it's not explitcitly stated in any documentations, `ldmatrix.x2` and `ldmatrix.x4` operate per 8x8 tile at a time. This is good, since it makes our analysis simpler: we only need to consider the case of loading a 8x8 tile.
+Consider a 2D tile of shape 8x64, BF16 dtype, in shared memory.
 
-TODO: figure showing memory banks for 8x32
+{{< figure src="bank_conflicts.svg" alt="Bank conflicts" caption="Memory bank distribution for a 8x64 BF16 tile in shared memory." >}}
+
+From the figure above, when we load the 8x8 `ldmatrix` tile, the same 4 banks 0-3 service all 32 threads, resulting in 8-way bank conflict. TODO: figure out why nsight reports 16-way bank confict.
 
 There are 2 standard solutions to this problem
 1. **Pad shared memory**. Due to `ldmatrix`'s alignment requirement, we can only pad the width with 16 bytes, equivalent to 4 banks. This means that when we go to the next row, the memory banks are shifted by 4, avoiding bank conflicts. In many cases, this is good enough. However, it's generally quite wasteful as we are not utilising the padded storage.
 2. **Swizzle shared memory address**. This is black magic: you XOR the shared memory address with some magic numbers, then suddenly bank conflicts disappear!
 
+Let's elaborate on the 2nd approach. I'm not smart enough to invent this trick, but at least I hope I can give some pointers on why it makes sense. We use XOR since this operation permutes the data nicely - there is a one-to-one mapping between input and output, given a fixed 2nd input. We get bank conflicts because when we move to the next row, we are hitting the same memory banks again -> we can use this row index to permute the addresses.
+
+In particular, if we look at the raw row addresses:
+- **Bits 0-3** are always zeros due to 16-byte alignment constraint.
+- **Bits 2-6** determine bank index. We only need to care about bits 4-6 since the lower bits are always zeros (due to alignment).
+- Row stride determines which bits are incremented when we move to the next row (this is by definition). If our 2D tile's width is 64 BF16 elements, row stride is 128 bytes. Going to the next row will increment bit 7, leaving **bits 0-6 unchanged** (but we don't care about bits 0-3).
+- Thus, we can XOR **bits 4-6** of row address with **bits 0-2** of row index, which is guaranteed to change for every row.
+
+If the tile width is different, e.g. 32 BF16, we can go through the same reasoning. Also notice that row index is encoded within the row address, thus we only need the row address and row stride to do swizzling.
+
+```cpp
+// NOTE: stride in bytes
+template <int STRIDE>
+__device__
+uint32_t swizzle(uint32_t index) {
+  // no need swizzling
+  if constexpr (STRIDE == 16)
+    return index;
+
+  uint32_t row_idx = (index / STRIDE) % 8;
+  uint32_t bits_to_xor = row_idx / max(64 / STRIDE, 1);
+  return index ^ (bits_to_xor << 4);
+}
+```
+
+To enable this swizzling, we need to add it to `cp.async` (write to shared memory) and `ldmatrix` (read from shared memory) calls.
+
+```diff
+// for cp.async
+- const uint32_t dst_addr = dst + (row * WIDTH + col) * sizeof(nv_bfloat16);
++ const uint32_t dst_addr = swizzle<WIDTH * sizeof(nv_bfloat16)>(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src_addr));
+
+// for ldmatrix
+- ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], addr);
++ ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], swizzle<DIM * sizeof(nv_bfloat16)>(addr));
+```
+
 Since this is a standard optimization in matmul kernels, I also added a small optimization for `ldmatrix`. I pre-compute row addresses and swizzling outside of the main loop, so that there is less work in the hot loop. Notice that swizzling is a XOR operation - we cannot exchange XOR with addition i.e. `(a + b) ^ c != (a ^ c) + b`. However, notice that if there is some alignment in the base address `a`, addition becomes XOR! i.e. `100 + 001 == 100 ^ 001`. Hence, when incrementing the input address of `ldmatrix`, we XOR it with row offset, instead of doing addition.
+
+Version 2: [attention_v2.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v2.cu).
+
+We can verify that there are no more bank conflicts with Nsight Compute. Benchmark results show an impressive uplift.
+
+Kernel                         | TFLOPS | % of SOL
+-------------------------------|--------|---------
+`F.sdpa()` (Flash Attention)   | 186.73 | 89.13%
+`F.sdpa()` (CuDNN)             | 203.61 | 97.19%
+`flash-attn`                   | 190.58 | 90.97%
+v1 (basic)                     | 142.87 | 68.20%
+v2 (shared memory swizzling)   | 181.11 | 86.45%
 
 ## Version 3 - 2-stage pipelining
 
+TODO: Nsight Compute (long scoreboard)
+
 One neat coding style that I have learned from [Mingfei Ma](https://github.com/mingfeima), a maintainer of PyTorch CPU backend, is to use [lambda expression](https://en.cppreference.com/w/cpp/language/lambda.html) to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same function multiple times.
+
+Version 3: [attention_v3.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v3.cu).
 
 ## Version 4 - ldmatrix.x4 for K and V
 
+For the last two versions, I couldn't identify any optimization opportunities from profiling data (maybe just skill issue).
+
 Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA tile. However, since we are handling a larger tile anyway, we can directly use `ldmatrix.x4` to issue fewer instructions. The trick is to select the appropriate 8x8 tiles and compute the row addresses correctly. There are two options: load `n16k16` tile, or `n8k32` tile.
+
+Version 4: [attention_v4.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v4.cu).
 
 ## Version 5 - better pipelining
 
 In version 3, we use double buffers for both K and V. However, this is redundant: while doing the 1st MMA, we can prefect V for the current iteration; while doing the 2nd MMA, we can prefetch K for the next iteration. In other words, we only need double buffers for K.
-
 
 ```cpp
 // prefetch K
@@ -675,11 +736,6 @@ for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
   // prefetch V for current iteration
   __syncthreads();
   load_V(kv_id);
-
-  // K smem->rmem
-  asm volatile("cp.async.wait_group 1;");
-  __syncthreads();
-  ...
 
   // 1st MMA
   ...
@@ -692,6 +748,21 @@ for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
 }
 ```
 
+Version 5: [attention_v5.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v5.cu).
+
 Using shared memory more efficiently means we can increase some tile sizes. The improvement is modest but noticeable.
 
+Kernel                         | TFLOPS | % of SOL
+-------------------------------|--------|---------
+`F.sdpa()` (Flash Attention)   | 186.73 | 89.13%
+`F.sdpa()` (CuDNN)             | 203.61 | 97.19%
+`flash-attn`                   | 190.58 | 90.97%
+v1 (basic)                     | 142.87 | 68.20%
+v2 (shared memory swizzling)   | 181.11 | 86.45%
+v3 (2-stage pipelining)        | 189.84 | 90.62%
+v4 (`ldmatrix.x4` for K and V) | 194.33 | 92.76%
+v5 (better pipelining)         | 197.74 | 94.39%
+
 ## What's next?
+
+CuDNN being the fastest means that there is still headroom available. I have tried inspecting profiling data of CuDNN's attention kernel, and found that they use a rather strange amount of shared memory (TODO).
