@@ -46,7 +46,7 @@ def sdpa(q: Tensor, k: Tensor, v: Tensor):
 
 Technically, if the inputs are BF16, some computations should remain in FP32, especially softmax. However, for brevity, we omit them.
 
-We are implementing the algorithm outlined in the [Flash Attention 2 paper](https://arxiv.org/abs/2307.08691). Each threadblock is responsible for a chunk of Q, and we will iterate along the sequence length of KV. A Python-like outline of the algorithm looks like below (P and V follow Flash Attention notation).
+We are implementing the algorithm outlined in the [Flash Attention 2 paper](https://arxiv.org/abs/2307.08691). Each threadblock is responsible for a chunk of Q, and we will iterate along the sequence length of KV. A Python-like outline of the algorithm looks like below (S and P follow Flash Attention notation).
 
 ```python
 scale = DIM ** -0.5
@@ -78,18 +78,18 @@ for b_idx in range(B):
         ### end of each threadblock's kernel
 ```
 
-It's implied `DIM` is small, so that we can hold `tile_Q` in register memory throughout the duration of the kernel. This is the reason pretty much all models nowadays use `head_dim=128`. There are exceptions of course, like [MLA](https://arxiv.org/abs/2405.04434), which uses `head_dim=576` for Q and K, and `head_dim=512` for V. I should study [FlashMLA](https://github.com/deepseek-ai/FlashMLA) some day.
+It's implied `DIM` is small, so that we can hold `tile_Q` in register memory throughout the duration of the kernel. This is the reason pretty much all models nowadays use `head_dim=128`. There are exceptions of course, like [MLA](https://arxiv.org/abs/2405.04434), which uses `head_dim=576` for Q and K, and `head_dim=512` for V. Talking about this, I should study [FlashMLA](https://github.com/deepseek-ai/FlashMLA) some day.
 
-Online softmax is quite tricky to explain, so let's delay the explanation of that part. At the high level, we just need to know that online softmax will transform `tile_S` to `tile_P`, and also rescale `tile_O`.
+Online softmax is quite tricky to explain, so let's delay the explanation of that part. At the high level, you just need to know that online softmax will transform `tile_S` to `tile_P`, and also rescale `tile_O`.
 
 ## Version 1 - Basic implementation
 
 We will follow the typical MMA flow
-- Load a 2D tile of data from global memory to shared memory using [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async). This requires Ampere (sm80 and above).
+- Load a 2D tile of data from global memory to shared memory using [cp.async](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async). This requires Ampere (sm80 and newer).
 - Load data from shared memory to register memory using [ldmatrix](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix).
 - Call [mma.m16n8k16](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float) for BF16 matrix multiplication (and accumulate).
 
-I want to focus on implementing the algorithm correctly first, hence I leave out more complicated tricks like shared memory swizzling and pipelining. This reduces the surface area for mistakes, and we will revisit them later. I will go through these briefly since they are not the focus of this blogpost. Readers are welcome to refer to matmuls with Tensor cores articles for more detailed explanations.
+I want to focus on implementing the algorithm correctly first, hence I leave out more complicated tricks like shared memory swizzling and pipelining. This reduces the surface area for mistakes, and we will revisit them later for performance optimization.
 
 ### Global to Shared memory data transfer
 
@@ -336,7 +336,7 @@ $$
 m=\max(s_0,s_1,\dots,s_{L_{kv}-1})
 $$
 
-$-m$ is max subtraction to improve numerical stability ($\exp(\cdot)$ can easily explode if its input is large). Let's bring out the denominator normaliser and write the whole row as a vector.
+$-m$ is max subtraction to improve numerical stability ($\exp(\cdot)$ can easily explode if its input is large). Let's bring out the denominator normalizer and write the whole row as a vector.
 
 $$
 \vec P =
@@ -374,13 +374,13 @@ $$
 o_{[0,L+1)} = \frac{1}{\sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)})} \sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)}) \cdot v_l
 $$
 
-Look at the normaliser (denominator)
+Look at the normalizer (denominator)
 
 $$
 \sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)}) = \colorbox{red}{$\displaystyle\exp(m_{[0,L)}-m_{[0,L+1)})$}\colorbox{orange}{$\displaystyle\sum_{l\in[0,L)}\exp(s_l-m_{[0,L)})$} + \colorbox{lime}{$\displaystyle\exp(s_L-m_{[0,L+1)})$}
 $$
 
-The equation means that we only need to $\colorbox{red}{rescale}$ the $\colorbox{orange}{previous normaliser}$ before adding the $\colorbox{lime}{new term}$. The same logic can be applied for the dot product with V (unnormalised output). **This is the key idea of online softmax and Flash Attention**.
+The equation means that we only need to $\colorbox{red}{rescale}$ the $\colorbox{orange}{previous normalizer}$ before adding the $\colorbox{lime}{new term}$. The same logic can be applied for the dot product with V (unnormalized output). **This is the key idea of online softmax and Flash Attention**.
 
 Define **attention state**
 
@@ -392,7 +392,7 @@ m \\\\
 \end{bmatrix}
 $$
 
-where $m$ is the max of elements seen so far, $\tilde{o}$ is the **unnormalised** output, and $\mathrm{sumexp}$ is the normaliser. We need $m$ to compute the rescaling factor as seen above.
+where $m$ is the max of elements seen so far, $\tilde{o}$ is the **unnormalized** output, and $\mathrm{sumexp}$ is the normalizer. We need $m$ to compute the rescaling factor as seen above.
 
 You can convince yourself that updating attention state is an **associative** operation - it does not matter the order in which elements are used to update the attention state.
 
@@ -452,7 +452,7 @@ for _ in range(Lk // BLOCK_KV):
   # 2nd MMA
   tile_O += tile_P @ tile_V  # [BLOCK_Q, DIM]
 
-# apply normalisation
+# apply normalization
 tile_O /= sumexp.unsqueeze(-1)
 ```
 
@@ -519,7 +519,7 @@ In a typical reduction kernel, when there are only 32 active threads left, we ca
 
 #### Rescaling
 
-With row max of the new tile, we can compute rescaling factor for (unnormalised) output as well as normaliser (sumexp of each row).
+With row max of the new tile, we can compute rescaling factor for (unnormalized) output as well as normalizer (sumexp of each row).
 
 ```cpp
 // new rowmax
@@ -544,7 +544,7 @@ rowmax[mma_id_q][1] = this_rowmax[1];
 
 We don't rescale `rowsumexp` here because we want to fuse it with addition of the new sumexp term later i.e. FMA - fused multiply add. We can't fuse multiplication with MMA, hence we need to do a separate multiplication for `O_rmem`.
 
-#### Pack `tile_S` to `tile_P` (and row sum exp)
+#### Pack `tile_S` to `tile_P` (and compute row sum exp)
 
 For the next part, we will loop over the row dimension again (`BLOCK_KV / MMA_N`), to compute and pack `tile_P` from `tile_S`, as well as doing reduction for sumexp. Recall that we declare registers for `S` and `P` as follows.
 
@@ -590,9 +590,9 @@ rowsumexp[mma_id_q][0] = rowsumexp[mma_id_q][0] * rescale[0] + this_rowsumexp[0]
 rowsumexp[mma_id_q][1] = rowsumexp[mma_id_q][1] * rescale[1] + this_rowsumexp[1];
 ```
 
-After this is the 2nd MMA: load V, then compute `tile_O += tile_P @ tile_V`. This completes our 1st version of Flash Attention. Actually we also need to normalise the output before writing `O_rmem` to global memory, but the logic for that should be pretty straightforward.
+After this is the 2nd MMA: load V, then compute `tile_O += tile_P @ tile_V`. This completes our 1st version of Flash Attention. Actually we also need to normalize the output before writing `O_rmem` to global memory, but the logic for that should be pretty straightforward.
 
-You can find the full code for the Version 1 at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v1.cu).
+You can find the full code for Version 1 at [attention_v1.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v1.cu).
 
 ### Benchmark setup
 
@@ -602,14 +602,18 @@ Anyway, now we need a script for correctness check as well as speed benchmark. I
 1. [attention.cpp](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention.cpp): provides PyTorch bindings for my attention kernels.
 2. [main.py](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/main.py): correctness check and speed benchmark.
 
-For the random inputs, I purposely add a small bias to the standard normal distribution so that the output has a positive mean. This is to avoid large relative error caused by zero mean.
+For correctness check, I compare against `F.sdpa()`, which should dispatch Flash Attention 2 by default (at least on my GPU and current PyTorch version). I also purposely add a small bias to the random inputs, which are sampled from the standard normal distribution, so that the output has a positive mean. This is to avoid large relative error caused by zero mean.
 
 ```python
 def generate_input(*shape):
     return torch.randn(shape).add(0.5).bfloat16().cuda()
 ```
 
-The reference implementation is `F.sdpa()`, which should dispatch Flash Attention 2 by default. For speed benchmarks, I compare against FA2 and CuDNN backends of `F.sdpa()`, as well as FA2 from [flash-attn](https://github.com/Dao-AILab/flash-attention) package. I did do some tuning of `BLOCK_Q` and `BLOCK_KV`, and obtained the following results.
+For speed benchmarks, it's generally a good idea to compare against (1) theoretical limit of the hardware i.e. Speed-of-Light, and (2) known good implementations. I'm more interested in the compute-bound regime of attention, hence I will be using FLOPS (floating point operations per second, with a capital S) as the metric for comparison.
+
+To compute FLOPS of a given kernel, we count the number of required floating point operations (FLOPs, with a small s), then divide by the latency. Just counting FLOPs from the MMAs should be good enough, which turns out to be `4 * bsize * num_heads * len_q * len_kv * head_dim`.
+
+The "known good implementations" are FA2 and CuDNN backends of `F.sdpa()`, as well as FA2 from [flash-attn](https://github.com/Dao-AILab/flash-attention) package. For my kernel, I did do some tuning of `BLOCK_Q` and `BLOCK_KV`, and obtained the following results.
 
 Kernel                         | TFLOPS | % of SOL
 -------------------------------|--------|---------
@@ -624,19 +628,19 @@ It doesn't look too bad for the first version, but we still have some headroom t
 
 Before moving to the next version, I want to talk about profiling tools. I think it's always a good idea to use profiling as the guide for optimization. Previously I only knew how to use [ncu](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html) at a very basic level. Seeing so many people using [Nsight Compute](https://developer.nvidia.com/nsight-compute) with cool diagrams, I decided to learn how to use it, and it was actually quite easy to use.
 
-Nsight Compute can run on a macOS machine with SSH access to another machine with NVIDIA GPU, which is exactly the setup I'm using right now (yes, I write code exclusively on my Macbook...). If you are unfamiliar with Nsight Compute, I recommend watching a tutorial or two to get acquainted with it.
+Nsight Compute can run on macOS with SSH access to another machine with NVIDIA GPU, which is exactly the setup I'm using right now (yes, I write code exclusively on my Macbook...). If you are unfamiliar with Nsight Compute, I recommend watching a tutorial or two to get acquainted with it.
 
 To enable source inspection feature, remember to pass `-lineinfo` to NVCC (see [here](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/main.py#L22)), and enable "Import Source" in Nsight Compute.
 
 ## Version 2 - Shared memory swizzling
 
-Let's do a profiling with Nsight Compute, and look at Warp State Statistics section.
+Let's do a profiling with Nsight Compute, and look at **Warp State Statistics** section.
 
 {{< figure src="v1_warp_state_stats.png" alt="Warp state statistics of version 1" caption="Warp state statistics of kernel version 1." >}}
 
 **Stall Math Pipe Throttle** being the highest is good - it means warps are busy with math operations i.e. Tensor Cores. The second highest is **Stall Short Scoreboard**. This typically means waiting for accesses to and from shared memory. You can check [Nsight Compute doc](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html) and search for `stalled_short_scoreboard`.
 
-We can double confirm this by looking at "Memory Workload Analysis", which reveals several problems.
+We can double confirm this by looking at **Memory Workload Analysis**, which reveals several problems.
 
 {{< figure src="v1_memory_analysis.png" alt="Memory analsysis of version 1" caption="Memory analysis of kernel version 1." >}}
 
@@ -650,9 +654,13 @@ Consider a 2D tile of shape 8x64, BF16 dtype, in shared memory.
 
 {{< figure src="bank_conflicts.svg" alt="Bank conflicts" caption="Memory bank distribution for a 8x64 BF16 tile in shared memory." >}}
 
-From the figure above, when we load the 8x8 `ldmatrix` tile, the same 4 banks 0-3 service all 32 threads, resulting in 8-way bank conflict. TODO: figure out why nsight reports 16-way bank confict.
+From the figure above, when we load the 8x8 `ldmatrix` tile, the same 4 banks 0-3 service all 32 threads, resulting in 8-way bank conflict. I'm not sure why Nsight Compute reports 16-way bank conflict as shown above. I tried looking up [matmul blogposts with swizzling](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html) and [NVIDIA forum threads](https://forums.developer.nvidia.com/t/ncu-detects-bank-conflicts-in-matrix-transposition-after-padding/239100/6), and found another way to check for bank conflicts was to go to the **Source** tab of Nsight Compute and check for **L1 Wavefronts Shared** and **L1 Wavefronts Shared Ideal** (I had to enable these two columns manually since they were not displayed by default for me).
 
-There are 2 standard solutions to this problem
+{{< figure src="ldmatrix_bank_conflicts.png" alt="Bank conflicts in ldmatrix" caption="Actual and Ideal L1 Wavefronts Shared of `ldmatrix` in kernel Version 1." >}}
+
+The ratio of **Ideal / Actual** is 8, matching our hypothesis of 8-way bank conflicts. I'm still not sure why there is a discrepancy between this value and the one in **Details** tab.
+
+Anyway, there are 2 standard solutions to this problem
 1. **Pad shared memory**. Due to `ldmatrix`'s alignment requirement, we can only pad the width with 16 bytes, equivalent to 4 banks. This means that when we go to the next row, the memory banks are shifted by 4, avoiding bank conflicts. In many cases, this is good enough. However, it's generally quite wasteful as we are not utilising the padded storage.
 2. **Swizzle shared memory address**. This is black magic: you XOR the shared memory address with some magic numbers, then suddenly bank conflicts disappear!
 
@@ -698,7 +706,7 @@ Since this is a standard optimization in matmul kernels, I also added a small op
 
 Version 2: [attention_v2.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v2.cu).
 
-We can verify that there are no more bank conflicts with Nsight Compute. Benchmark results show an impressive uplift.
+We can verify that there are no more bank conflicts with Nsight Compute. Benchmark results show an impressive uplift (I always re-tune `BLOCK_Q` and `BLOCK_KV` for new versions of the kernel).
 
 Kernel                         | TFLOPS | % of SOL
 -------------------------------|--------|---------
@@ -721,6 +729,8 @@ Version 3: [attention_v3.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c2
 For the last two versions, I couldn't identify any optimization opportunities from profiling data (maybe just skill issue).
 
 Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA tile. However, since we are handling a larger tile anyway, we can directly use `ldmatrix.x4` to issue fewer instructions. The trick is to select the appropriate 8x8 tiles and compute the row addresses correctly. There are two options: load `n16k16` tile, or `n8k32` tile.
+
+TODO: figure for n16k16 and n8k32
 
 Version 4: [attention_v4.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v4.cu).
 
