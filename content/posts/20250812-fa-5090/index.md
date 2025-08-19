@@ -636,13 +636,13 @@ To enable source inspection feature, remember to pass `-lineinfo` to NVCC (see [
 
 Let's do a profiling with Nsight Compute, and look at **Warp State Statistics** section.
 
-{{< figure src="v1_warp_state_stats.png" alt="Warp state statistics of version 1" caption="Warp state statistics of kernel version 1." >}}
+{{< figure src="v1_warp_state_stats.png" alt="Warp state statistics of v1" caption="Warp state statistics of kernel v1." >}}
 
 **Stall Math Pipe Throttle** being the highest is good - it means warps are busy with math operations i.e. Tensor Cores. The second highest is **Stall Short Scoreboard**. This typically means waiting for accesses to and from shared memory. You can check [Nsight Compute doc](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html) and search for `stalled_short_scoreboard`.
 
 We can double confirm this by looking at **Memory Workload Analysis**, which reveals several problems.
 
-{{< figure src="v1_memory_analysis.png" alt="Memory analsysis of version 1" caption="Memory analysis of kernel version 1." >}}
+{{< figure src="v1_memory_analysis.png" alt="Memory analsysis of v1" caption="Memory analysis of kernel v1." >}}
 
 - **L1TEX Global Store Access Pattern** comes from storing the output, since it is the only global write we have. This is not important since the runtime of looping over the sequence length of KV should dominate when `len_kv` is large.
 - **L1TEX Local Load/Store Access Pattern** is due to register spilling. Since it's register spilling, only spilling and reloading 1 element at a time is normal. Reducing `BLOCK_Q` (so that we use fewer registers to hold accumulators) would resolve this issue, but my manual tuning showed that some spilling was actually faster.
@@ -656,7 +656,7 @@ Consider a 2D tile of shape 8x64, BF16 dtype, in shared memory.
 
 From the figure above, when we load the 8x8 `ldmatrix` tile, the same 4 banks 0-3 service all 32 threads, resulting in 8-way bank conflict. I'm not sure why Nsight Compute reports 16-way bank conflict as shown above. I tried looking up [matmul blogposts with swizzling](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html) and [NVIDIA forum threads](https://forums.developer.nvidia.com/t/ncu-detects-bank-conflicts-in-matrix-transposition-after-padding/239100/6), and found another way to check for bank conflicts was to go to the **Source** tab of Nsight Compute and check for **L1 Wavefronts Shared** and **L1 Wavefronts Shared Ideal** (I had to enable these two columns manually since they were not displayed by default for me).
 
-{{< figure src="ldmatrix_bank_conflicts.png" alt="Bank conflicts in ldmatrix" caption="Actual and Ideal L1 Wavefronts Shared of `ldmatrix` in kernel Version 1." >}}
+{{< figure src="ldmatrix_bank_conflicts.png" alt="Bank conflicts in ldmatrix" caption="Actual and Ideal L1 Wavefronts Shared of `ldmatrix` in kernel v1." >}}
 
 The ratio of **Ideal / Actual** is 8, matching our hypothesis of 8-way bank conflicts. I'm still not sure why there is a discrepancy between this value and the one in **Details** tab.
 
@@ -710,19 +710,28 @@ We can verify that there are no more bank conflicts with Nsight Compute. Benchma
 
 Kernel                         | TFLOPS | % of SOL
 -------------------------------|--------|---------
-`F.sdpa()` (Flash Attention)   | 186.73 | 89.13%
-`F.sdpa()` (CuDNN)             | 203.61 | 97.19%
-`flash-attn`                   | 190.58 | 90.97%
 v1 (basic)                     | 142.87 | 68.20%
 v2 (shared memory swizzling)   | 181.11 | 86.45%
 
 ## Version 3 - 2-stage pipelining
 
-TODO: Nsight Compute (long scoreboard)
+{{< figure src="v2_warp_state_stats.png" alt="Warp state statistics of v2" caption="Warp state statistics of kernel v2." >}}
 
-One neat coding style that I have learned from [Mingfei Ma](https://github.com/mingfeima), a maintainer of PyTorch CPU backend, is to use [lambda expression](https://en.cppreference.com/w/cpp/language/lambda.html) to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same function multiple times.
+**Stall Short Scoreboard** is no longer an issue, since we have handled it with swizzling. Now the issues are **Stall Wait** and **Stall Long Scoreboard**. The former is waiting at `__syncthreads()`, while the latter usually means waiting for global memory accesses. Notice that right now, in the main loop, we only have `__syncthreads()` after global->shared data transfer (`cp.async`). Hence, I believe Stall Wait is due to global memory access as well.
+
+Up until now, we haven't overlapped global memory operations with compute operations (MMA). This means Tensor Cores are idle while waiting for global->shared transfer to complete. This seems to be the right time to introduce **pipelining** or **double-buffering**: allocate more shared memory than needed so that we can prefetch data for the next iteration while working on the current iteration.
+- Technically we can also pipeline shared->register data transfer. This is in fact mentioned in [Efficient GEMM doc](https://github.com/NVIDIA/cutlass/blob/v4.1.0/media/docs/cpp/efficient_gemm.md) of CUTLASS. However, I could never implement it successfully on my 5090. Inspecting the generated SASS of my current code, I see that there is interleaving between `LDSM` (`ldmatrix` in PTX) and `HMMA` (half-precision `mma` in PTX), probably done by the compiler to achieve similar memory-compute overlapping effect.
+
+TODO: use commit_group and wait_group
+
+One neat coding style that I have learned from [Mingfei Ma](https://github.com/mingfeima), the maintainer of PyTorch CPU backend, is to use [lambda expression](https://en.cppreference.com/w/cpp/language/lambda.html) to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same block of code multiple times.
 
 Version 3: [attention_v3.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v3.cu).
+
+Kernel                         | TFLOPS | % of SOL
+-------------------------------|--------|---------
+v2 (shared memory swizzling)   | 181.11 | 86.45%
+v3 (2-stage pipelining)        | 189.84 | 90.62%
 
 ## Version 4 - ldmatrix.x4 for K and V
 
@@ -733,6 +742,13 @@ Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA
 TODO: figure for n16k16 and n8k32
 
 Version 4: [attention_v4.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v4.cu).
+
+Kernel                         | TFLOPS | % of SOL
+-------------------------------|--------|---------
+v3 (2-stage pipelining)        | 189.84 | 90.62%
+v4 (`ldmatrix.x4` for K and V) | 194.33 | 92.76%
+
+I was quite surprised at the speedup. The only difference in this version is that we use 2x fewer `ldmatrix` instructions in the main loop. Yet, we obtain a non-trivial improvement, inching towards SOL.
 
 ## Version 5 - better pipelining
 
@@ -764,6 +780,13 @@ Using shared memory more efficiently means we can increase some tile sizes. The 
 
 Kernel                         | TFLOPS | % of SOL
 -------------------------------|--------|---------
+v4 (`ldmatrix.x4` for K and V) | 194.33 | 92.76%
+v5 (better pipelining)         | 197.74 | 94.39%
+
+## What's next?
+
+Kernel                         | TFLOPS | % of SOL
+-------------------------------|--------|---------
 `F.sdpa()` (Flash Attention)   | 186.73 | 89.13%
 `F.sdpa()` (CuDNN)             | 203.61 | 97.19%
 `flash-attn`                   | 190.58 | 90.97%
@@ -772,7 +795,5 @@ v2 (shared memory swizzling)   | 181.11 | 86.45%
 v3 (2-stage pipelining)        | 189.84 | 90.62%
 v4 (`ldmatrix.x4` for K and V) | 194.33 | 92.76%
 v5 (better pipelining)         | 197.74 | 94.39%
-
-## What's next?
 
 CuDNN being the fastest means that there is still headroom available. I have tried inspecting profiling data of CuDNN's attention kernel, and found that they use a rather strange amount of shared memory (TODO).
