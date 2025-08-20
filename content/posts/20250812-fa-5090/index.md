@@ -131,7 +131,7 @@ Note:
 - Data type of shared memory pointer `dst` is `uint32_t`. This is intentional. Pretty much all PTX instructions expect shared memory addresses to be in [shared state space](https://docs.nvidia.com/cuda/parallel-thread-execution/#state-spaces). We can convert C++ pointers, which are generic addresses, to shared state space addresses with `static_cast<uint32_t>(__cvta_generic_to_shared(ptr))`. This is done outside of `global_to_shared()`.
 
 To finish using `cp.async`, we also need to add the following:
-- `cp.async.commit_group` (PTX): commit all previously issued `cp.async` instructions into a **group**. This group will be the unit for synchronization.
+- `cp.async.commit_group` (PTX): commit all previously issued `cp.async` instructions into a **`cp.async` group**. This group will be the unit for synchronization.
 - `cp.async.wait_all` (PTX): wait for all committed groups to finish.
 - `__syncthreads()`: make sure all threads (in a threadblock) reach here before reading the loaded data in shared memory (because one thread may read data loaded by another thread). More importantly, this broadcasts **visibility** of the new data to all threads in the threadblock. Without `__syncthreads()`, the compiler is free to optimize away memory accesses.
 
@@ -680,7 +680,7 @@ From the figure above, when we load the 8x8 `ldmatrix` tile, the same 4 banks 0-
 
 {{< figure src="ldmatrix_bank_conflicts.png" alt="Bank conflicts in ldmatrix" caption="Actual and Ideal L1 Wavefronts Shared of `ldmatrix` in kernel v1." >}}
 
-The ratio of **Ideal / Actual** is 8, matching our hypothesis of 8-way bank conflicts. I'm still not sure why there is a discrepancy between this value and the one in **Details** tab.
+The ratio of **Actual / Ideal** is 8, matching our hypothesis of 8-way bank conflicts. I'm still not sure why there is a discrepancy between this value and the one in **Details** tab.
 
 Anyway, there are 2 standard solutions to this problem
 1. **Pad shared memory**. Due to `ldmatrix`'s alignment requirement, we can only pad the width with 16 bytes, equivalent to 4 banks. This means that when we go to the next row, the memory banks are shifted by 4, avoiding bank conflicts. In many cases, this is good enough. However, it's generally quite wasteful as we are not utilising the padded storage.
@@ -739,14 +739,55 @@ v2 (shared memory swizzling)   | 181.11 | 86.45%
 
 {{< figure src="v2_warp_state_stats.png" alt="Warp state statistics of v2" caption="Warp state statistics of kernel v2." >}}
 
-**Stall Short Scoreboard** is no longer an issue, since we have handled it with swizzling. Now the issues are **Stall Wait** and **Stall Long Scoreboard**. The former is waiting at `__syncthreads()`, while the latter usually means waiting for global memory accesses. Notice that right now, in the main loop, we only have `__syncthreads()` after global->shared data transfer (`cp.async`). Hence, I believe Stall Wait is due to global memory access as well.
+**Stall Short Scoreboard** is no longer an issue, since we have handled it with swizzling. Now the issues are **Stall Wait** and **Stall Long Scoreboard**. The former is waiting at `__syncthreads()`, while the latter usually means waiting for global memory accesses. Notice that right now, in the main loop, we only have `__syncthreads()` after global->shared data transfer i.e. `cp.async`. Hence, I believe Stall Wait is due to global memory access as well.
 
-Up until now, we haven't overlapped global memory operations with compute operations (MMA). This means Tensor Cores are idle while waiting for global->shared transfer to complete. This seems to be the right time to introduce **pipelining** or **double-buffering**: allocate more shared memory than needed so that we can prefetch data for the next iteration while working on the current iteration.
+Up until now, we haven't overlapped global memory operations with compute operations (MMA). This means the Tensor Cores are idle while waiting for global->shared transfer to complete. This seems to be the right time to introduce **pipelining** or **double-buffering**: allocate more shared memory than needed so that we can prefetch data for the next iteration while working on the current iteration.
 - Technically we can also pipeline shared->register data transfer. This is in fact mentioned in [Efficient GEMM doc](https://github.com/NVIDIA/cutlass/blob/v4.1.0/media/docs/cpp/efficient_gemm.md) of CUTLASS. However, I could never implement it successfully on my 5090. Inspecting the generated SASS of my current code, I see that there is interleaving between `LDSM` (`ldmatrix` in PTX) and `HMMA` (half-precision `mma` in PTX), probably done by the compiler to achieve similar memory-compute overlapping effect.
 
-TODO: use commit_group and wait_group
+Let's discuss the more general implementation of **N-stage pipelining**. This [NVIDIA blogpost](https://developer.nvidia.com/blog/controlling-data-movement-to-boost-performance-on-ampere-architecture/) gives a pretty good explanation of the idea, but generally I don't really like using CUDA C++ API (and considering that CUTLASS also doesn't, I think it's more fun to use PTX directly). N-stage means there are N ongoing stages at any point in time. This will be the **invariance** we want to keep throughout the inner loop.
+- This is the same concept of `num_stages` mentioned in [triton.Config](https://triton-lang.org/main/python-api/generated/triton.Config.html) for autotuning.
+- Double buffering is a special case of N=2.
 
-One neat coding style that I have learned from [Mingfei Ma](https://github.com/mingfeima), the maintainer of PyTorch CPU backend, is to use [lambda expression](https://en.cppreference.com/w/cpp/language/lambda.html) to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same block of code multiple times.
+```python
+num_stages = 4
+
+# set up num_stages buffers
+tile_K_buffers = torch.empty(num_stages, BLOCK_KV, DIM)
+tile_V_buffers = torch.empty(num_stages, BLOCK_KV, DIM)
+
+# initiate with (num_stages-1) prefetches
+# this is async: the code continues before data loading finishes.
+for stage_idx in range(num_stages-1):
+    tile_K_buffers[stage_idx] = load_K(stage_idx)
+    tile_V_buffers[stage_idx] = load_V(stage_idx)
+
+for tile_KV_idx in range(Lk // BLOCK_KV):
+    # prefetch tile (num_stages-1) ahead
+    # now we have num_stages global->shared inflight.
+    # in practice, we need to guard against out of bounds memory access.
+    prefetch_idx = tile_KV_idx + num_stages - 1
+    tile_K_buffers[prefetch_idx % num_stages] = load_K(prefetch_idx)
+    tile_V_buffers[prefetch_idx % num_stages] = load_V(prefetch_idx)
+
+    # select the current tile
+    # we need a synchronization mechanism to make sure data loading
+    # for this tile has finished.
+    # this "consumes" the oldest global->shared inflight, and
+    # replaces it with compute operation.
+    tile_K = tile_K_buffers[tile_KV_idx % num_stages]
+    tile_V = tile_V_buffers[tile_KV_idx % num_stages]
+
+    # compute attention as normal
+    ...
+```
+
+NVIDIA engineers/architects have graced us with `cp.async.commit_group` and `cp.async.wait_group` to implement this elegantly.
+- `cp.async.commit_group`: one `cp.async` group maps naturally to one prefetch stage in the pipeline.
+- `cp.async.wait_group N`: means wait until there are at most N ongoing groups left. If we do `cp.async.wait_group num_stages-1`, it means we wait until the earliest prefetch has finished (remember, we always have `num_stages` ongoing prefetches as the loop invariance).
+
+In our case of implementing attention, there are two small changes. The first one is that since we already consume a lot of shared memory for K and V, and [consumer GPUs typically have modest shared memory size](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications-technical-specifications-per-compute-capability) compared to their server counterparts, I decide to keep it to 2-stage pipeline, which also makes the code slightly simpler. Secondly, we can split K and V prefetches since issuing V prefetch can be delayed to after the 1st MMA. The second change requires some minor adjustments: each K and V prefetch is a separate `cp.async` group (so that we can wait for them independently), hence we will have `num_stages * 2` groups as the loop invariance.
+
+One neat coding style that I have learned from [Mingfei Ma](https://github.com/mingfeima), the maintainer of PyTorch CPU backend, is to use [lambda expression](https://github.com/pytorch/pytorch/blob/v2.8.0/aten/src/ATen/native/cpu/int8mm_kernel.cpp#L63) to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same block of code multiple times.
 
 Version 3: [attention_v3.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v3.cu).
 
