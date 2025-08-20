@@ -130,6 +130,28 @@ Note:
 - The loop `for (int iter = 0; iter < num_iters; iter++)` is written this way so that the compiler (`nvcc`) can fully unroll the loop. `num_iters` is known at compile time (guaranteed by `constexpr`). If we mix `tid` in the loop, which is a "dynamic" variable to the compiler, the loop can't be unrolled, even when we know certain constraints about the variable i.e. `tid < TB_SIZE`.
 - Data type of shared memory pointer `dst` is `uint32_t`. This is intentional. Pretty much all PTX instructions expect shared memory addresses to be in [shared state space](https://docs.nvidia.com/cuda/parallel-thread-execution/#state-spaces). We can convert C++ pointers, which are generic addresses, to shared state space addresses with `static_cast<uint32_t>(__cvta_generic_to_shared(ptr))`. This is done outside of `global_to_shared()`.
 
+To finish using `cp.async`, we also need to add the following:
+- `cp.async.commit_group` (PTX): commit all previously issued `cp.async` instructions into a **group**. This group will be the unit for synchronization.
+- `cp.async.wait_all` (PTX): wait for all committed groups to finish.
+- `__syncthreads()`: make sure all threads (in a threadblock) reach here before reading the loaded data in shared memory (because one thread may read data loaded by another thread). More importantly, this broadcasts **visibility** of the new data to all threads in the threadblock. Without `__syncthreads()`, the compiler is free to optimize away memory accesses.
+
+As always, refer to [PTX doc](https://docs.nvidia.com/cuda/parallel-thread-execution/) for more information about the instructions. Basically we issue multiple `cp.async` and wait for them to complete immediately right after. `commit_group` and `wait_group` provide a mechanism for us to implement pipelining later. But for now, just need to know we have to write it that way to use `cp.async`.
+
+Our code snippet would look something like this.
+
+```cpp
+// nv_bfloat16 *Q;
+// uint32_t Q_smem;
+// const int tid = blockIdx.x;
+// constexpr int TB_SIZE = 32 * 4;
+// constexpr int DIM = 128;
+
+global_to_shared<BLOCK_Q, DIM, TB_SIZE>(Q_smem, Q, DIM, tid);
+asm volatile("cp.async.commit_group;");
+asm volatile("cp.async.wait_all;");
+__syncthreads();
+```
+
 ### Shared memory to Register memory data transfer
 
 When doing global->shared data transfer, we think in terms of threadblock tiles and individual CUDA threads. For shared->register data transfer, since this is to service later MMA instructions, we think in terms of warp tiles/MMA tiles and warps. Following Flash Attention 2 (section 3.3), we let each warp in a threadblock handle a portion of `tile_Q`, splitting along the Q sequence length dimension. This means that different warps will index into different chunks of `tile_Q`, but they all index to the same `tile_K` and `tile_V` chunks in the KV-sequence-length loop.
@@ -553,7 +575,7 @@ float S_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_N][4]      // m16n8
 uint32_t P_rmem[WARP_Q / MMA_M][BLOCK_KV / MMA_K][4];  // m16k16
 ```
 
-Look up the thread/register layout for MMA multiplicand A and output C/D again in PTX docs. Luckily, the layouts are exactly the same - within an 8x8 tile, the arrangement of elements is identical.
+Look up the thread/register layout for MMA multiplicand A and output C/D again in PTX doc. Luckily, the layouts are exactly the same - within an 8x8 tile, the arrangement of elements is identical.
 
 {{< figure src="m16n8_to_m16k16.svg" alt="Register layout of MMA m16n8k16" caption="The left half of multiplicand A has the same layout as accumulator. Source: [NVIDIA PTX doc](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float)." >}}
 
