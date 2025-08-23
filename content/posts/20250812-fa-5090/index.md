@@ -1,6 +1,5 @@
 +++
-date = '2025-08-14T18:38:59+08:00'
-draft = true
+date = '2025-08-23T15:25:20+08:00'
 title = 'Writing Speed-of-Light Flash Attention for 5090 in CUDA C++'
 url = 'fa-5090'
 +++
