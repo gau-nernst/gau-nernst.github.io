@@ -988,6 +988,7 @@ Looking back, our kernel v3 already beats the official Flash Attention kernel, w
 Anyway, here are some fun ideas to build on top of this (apart from trying to beat CuDNN):
 1. Implement the backward pass (which I heard is much harder than the forward pass)
 2. Quantized/low-bit attention, especially with NVFP4 on 5090. I believe [SageAttention](https://github.com/thu-ml/SageAttention) is the open-source frontier on this front.
-3. [PagedAttention](https://arxiv.org/abs/2309.06180) (i.e. vLLM and SGLang), and then build a performant dependency-free serving engine.
+3. Use TMA (i.e. `cp.async.bulk`) with warp-specialization design. [Pranjal](https://x.com/pranjalssh) wrote a [nice blogpost](https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog) on this for H100 matmul.
+4. [PagedAttention](https://arxiv.org/abs/2309.06180) (i.e. vLLM and SGLang), and then build a performant dependency-free serving engine.
 
 I hope this blogpost is useful to many people. Happy writing kernels!
