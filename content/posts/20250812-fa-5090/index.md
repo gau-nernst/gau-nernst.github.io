@@ -650,7 +650,7 @@ It doesn't look too bad for the first version, but we still have some headroom t
 
 Before moving to the next version, I want to talk about profiling tools. I think it's always a good idea to use profiling as the guide for optimization. Previously I only knew how to use [ncu](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html) at a very basic level. Seeing so many people using [Nsight Compute](https://developer.nvidia.com/nsight-compute) with cool diagrams, I decided to learn how to use it, and it was actually quite easy to use.
 
-Nsight Compute can run on macOS with SSH access to another machine with NVIDIA GPU, which is exactly the setup I'm using right now (yes, I write code exclusively on my Macbook...). If you are unfamiliar with Nsight Compute, I recommend watching a tutorial or two to get acquainted with it.
+Nsight Compute can run on macOS with SSH access to another machine with NVIDIA GPU, which is exactly the setup I'm using right now (yes, I write code exclusively on my Macbook). If you are unfamiliar with Nsight Compute, I recommend watching a tutorial or two to get acquainted with it.
 
 To enable source inspection feature, remember to pass `-lineinfo` to NVCC (see [here](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/main.py#L22)), and enable "Import Source" in Nsight Compute.
 
@@ -752,7 +752,7 @@ v2 (shared memory swizzling)   | 181.11 | 86.45%
 {{< figure src="v2_warp_state_stats.png" alt="Warp state statistics of v2" caption="Warp state statistics of kernel v2." >}}
 
 **Stall Short Scoreboard** is no longer an issue, since we have handled it with swizzling. Now the issues are:
-- **Stall Wait** (`stalled_wait` in Nsight Compute doc): "waiting on a fixed latency execution dependency", and doesn't seem to be a big issue.
+- **Stall Wait** (`stalled_wait` in Nsight Compute doc): "waiting on a fixed latency execution dependency", doesn't seem to be a big issue.
 - **Stall Long Scoreboard** (`stalled_long_scoreboard` in Nsight Compute doc): usually means waiting for global memory accesses.
 
 Up until now, we haven't overlapped global memory operations with compute operations (MMA). This means the Tensor Cores are idle while waiting for global->shared transfer to complete. This seems to be the right time to introduce **pipelining** or **double-buffering**: allocate more shared memory than needed so that we can prefetch data for the next iteration while working on the current iteration.
@@ -834,12 +834,12 @@ for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
   // now we have 3 prefetches in flight: K-V-K
   load_K(kv_id + 1);
 
-  // wait for current K prefetch to finish
+  // wait for prefetch of current K to finish and load K shared->registers
   // now we have 2 prefetches in flight: V-K
   asm volatile("cp.async.wait_group 2;");
   __syncthreads();
+  ...
 
-  // K shared->registers
   // 1st MMA
   ...
 
@@ -850,12 +850,12 @@ for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
   // online softmax
   ...
 
-  // wait for current V prefetch to finish
+  // wait for prefetch of current V to finish and load V shared->registers
   // now we have 2 prefetches in flight: K-V
   asm volatile("cp.async.wait_group 2;");
   __syncthreads();
+  ...
 
-  // V shared->registers
   // 2nd MMA
   ...
 }
@@ -931,23 +931,38 @@ load_K(0);
 
 for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
   // prefetch V for current iteration
+  // now we have 2 prefetches in flight: K-V
+  // __syncthreads() here is required to make sure we finish using V_smem
+  // from the previous iteration, since there is only 1 shared buffer for V.
   __syncthreads();
   load_V(kv_id);
+
+  // wait for prefetch of current K and load K shared->registers
+  // now we have 1 prefetch in flight: V
+  ...
 
   // 1st MMA
   ...
 
   // prefetch K for the next iteration
+  // now we have 2 prefetches in flight: V-K
   load_K(kv_id + 1);
 
-  // online softmax and 2nd MMA
+  // online softmax
+  ...
+
+  // wait for prefetch of current V and load V shared->registers
+  // now we have 1 prefetch in flight: K
+  ...
+
+  // 2nd MMA
   ...
 }
 ```
 
 Version 5: [attention_v5.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v5.cu).
 
-Using shared memory more efficiently means we can increase some tile sizes. The improvement is modest but noticeable.
+Using shared memory more efficiently means we can increase some tile sizes. I increased `BLOCK_KV` from 32 back to 64. Increasing `BLOCK_Q` is hard since it will double the amount of registers to hold the accumulator. The improvement is modest but noticeable.
 
 Kernel                         | TFLOPS | % of SOL
 -------------------------------|--------|---------
@@ -967,4 +982,13 @@ v3 (2-stage pipelining)        | 189.84 | 90.62%
 v4 (`ldmatrix.x4` for K and V) | 194.33 | 92.76%
 v5 (better pipelining)         | 197.74 | 94.39%
 
-CuDNN being the fastest means that there is still headroom available. I have tried inspecting profiling data of CuDNN's attention kernel, and found that they use a rather strange amount of shared memory (TODO).
+Looking back, our kernel v3 already beats the official Flash Attention kernel, which is a nice surprise. It feels like it's rather easy to get good performance out of 5090 compared to previous generations. However, our best kernel lagging behind CuDNN's means that there is still headroom available. I tried inspecting profiling data of CuDNN's attention kernel, and got the following details
+- Kernel name: `cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_3_64x64x128_4x1x1_kernel0_0` -> I'm guessing it means using sm80 features, `BLOCK_Q=BLOCK_KV=64`, `DIM=128`, and 4 warps (same as our kernel v5).
+- Shared memory: 40.96 Kb -> that is `40960 / (64 * 128 * 2) = 2.5` times `(BLOCK_KV, DIM)`. The fractional number of buffers is rather strange. Or is their kernel more like `BLOCK_KV=32` and 5 buffers? I have no idea.
+
+Anyway, here are some fun ideas to build on top of this (apart from trying to beat CuDNN):
+1. Implement the backward pass (which I heard is much harder than the forward pass)
+2. Quantized/low-bit attention, especially with NVFP4 on 5090. I believe [SageAttention](https://github.com/thu-ml/SageAttention) is the open-source frontier on this front.
+3. [PagedAttention](https://arxiv.org/abs/2309.06180) (i.e. vLLM and SGLang), and then build a performant dependency-free serving engine.
+
+I hope this blogpost is useful to many people. Happy writing kernels!
