@@ -724,7 +724,19 @@ asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(s
 + ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], swizzle<DIM * sizeof(nv_bfloat16)>(addr));
 ```
 
-Since this is a standard optimization in matmul kernels, I also added a small optimization for `ldmatrix`. I pre-compute row addresses and swizzling outside of the main loop, so that there is less work in the hot loop. Notice that swizzling is a XOR operation - we cannot exchange XOR with addition i.e. `(a + b) ^ c != (a ^ c) + b`. However, notice that if there is some alignment in the base address `a`, addition becomes XOR! i.e. `100 + 001 == 100 ^ 001`. Hence, when incrementing the input address of `ldmatrix`, we XOR it with row offset, instead of doing addition.
+Since this is a standard optimization in matmul kernels, I also added a small optimization for `ldmatrix`. I pre-compute row addresses and swizzling outside of the main loop, so that there is less work in the hot loop. When we iterate over MMA tiles within a warp tile, we need to increment the address. However, swizzling is a XOR operation, and we cannot simply exchange XOR with addition i.e. `(a + b) ^ c != (a ^ c) + b`. Notice that if there is some alignment in the base address `a`, addition becomes XOR! i.e. `100 + 001 == 100 ^ 001`. Hence, when incrementing the input address of `ldmatrix`, we XOR it with column offset, instead of doing addition. Row offset will affect bits higher than the swizzled bits, so we can keep addition for it.
+
+```cpp
+// K shared->registers
+for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+  for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d++) {
+    // swizzle(addr + offset) = swizzle(addr) XOR offset
+    uint32_t addr = K_smem_thread;
+    addr += mma_id_kv * MMA_N * DIM * sizeof(nv_bfloat16);  // row
+    addr ^= mma_id_d * MMA_K * sizeof(nv_bfloat16);  // col
+    ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], addr);
+  }
+```
 
 Version 2: [attention_v2.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v2.cu).
 
@@ -739,7 +751,9 @@ v2 (shared memory swizzling)   | 181.11 | 86.45%
 
 {{< figure src="v2_warp_state_stats.png" alt="Warp state statistics of v2" caption="Warp state statistics of kernel v2." >}}
 
-**Stall Short Scoreboard** is no longer an issue, since we have handled it with swizzling. Now the issues are **Stall Wait** and **Stall Long Scoreboard**. The former is waiting at `__syncthreads()`, while the latter usually means waiting for global memory accesses. Notice that right now, in the main loop, we only have `__syncthreads()` after global->shared data transfer i.e. `cp.async`. Hence, I believe Stall Wait is due to global memory access as well.
+**Stall Short Scoreboard** is no longer an issue, since we have handled it with swizzling. Now the issues are:
+- **Stall Wait** (`stalled_wait` in Nsight Compute doc): "waiting on a fixed latency execution dependency", and doesn't seem to be a big issue.
+- **Stall Long Scoreboard** (`stalled_long_scoreboard` in Nsight Compute doc): usually means waiting for global memory accesses.
 
 Up until now, we haven't overlapped global memory operations with compute operations (MMA). This means the Tensor Cores are idle while waiting for global->shared transfer to complete. This seems to be the right time to introduce **pipelining** or **double-buffering**: allocate more shared memory than needed so that we can prefetch data for the next iteration while working on the current iteration.
 - Technically we can also pipeline shared->register data transfer. This is in fact mentioned in [Efficient GEMM doc](https://github.com/NVIDIA/cutlass/blob/v4.1.0/media/docs/cpp/efficient_gemm.md) of CUTLASS. However, I could never implement it successfully on my 5090. Inspecting the generated SASS of my current code, I see that there is interleaving between `LDSM` (`ldmatrix` in PTX) and `HMMA` (half-precision `mma` in PTX), probably done by the compiler to achieve similar memory-compute overlapping effect.
@@ -773,7 +787,7 @@ for tile_KV_idx in range(Lk // BLOCK_KV):
     # we need a synchronization mechanism to make sure data loading
     # for this tile has finished.
     # this "consumes" the oldest global->shared inflight, and
-    # replaces it with compute operation.
+    # replaces it with a compute stage.
     tile_K = tile_K_buffers[tile_KV_idx % num_stages]
     tile_V = tile_V_buffers[tile_KV_idx % num_stages]
 
@@ -785,11 +799,75 @@ NVIDIA engineers/architects have graced us with `cp.async.commit_group` and `cp.
 - `cp.async.commit_group`: one `cp.async` group maps naturally to one prefetch stage in the pipeline.
 - `cp.async.wait_group N`: means wait until there are at most N ongoing groups left. If we do `cp.async.wait_group num_stages-1`, it means we wait until the earliest prefetch has finished (remember, we always have `num_stages` ongoing prefetches as the loop invariance).
 
-In our case of implementing attention, there are two small changes. The first one is that since we already consume a lot of shared memory for K and V, and [consumer GPUs typically have modest shared memory size](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications-technical-specifications-per-compute-capability) compared to their server counterparts, I decide to keep it to 2-stage pipeline, which also makes the code slightly simpler. Secondly, we can split K and V prefetches since issuing V prefetch can be delayed to after the 1st MMA. The second change requires some minor adjustments: each K and V prefetch is a separate `cp.async` group (so that we can wait for them independently), hence we will have `num_stages * 2` groups as the loop invariance.
+In our case of implementing attention, there are two small changes.
+1. Since we already consume a lot of shared memory for K and V, and [consumer GPUs typically have modest shared memory size](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications-technical-specifications-per-compute-capability) compared to their server counterparts, I decide to keep it to 2-stage pipeline, which also makes the code slightly simpler.
+2. We can split K and V prefetches since issuing V prefetch can be delayed to after the 1st MMA. The second change requires some minor adjustments: each K and V prefetch is a separate `cp.async` group (so that we can wait for them independently).
 
 One neat coding style that I have learned from [Mingfei Ma](https://github.com/mingfeima), the maintainer of PyTorch CPU backend, is to use [lambda expression](https://github.com/pytorch/pytorch/blob/v2.8.0/aten/src/ATen/native/cpu/int8mm_kernel.cpp#L63) to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same block of code multiple times.
 
+```cpp
+const int num_kv_iter = cdiv(len_kv, BLOCK_KV);
+
+auto load_K = [&](int kv_id) {
+  // guard against out-of-bounds global read
+  if (kv_id < num_kv_iter) {
+    // select the shared buffer destination
+    const uint32_t dst = K_smem + (kv_id % 2) * (2 * BLOCK_KV * DIM * sizeof(nv_bfloat16));
+    global_to_shared_swizzle<BLOCK_KV, DIM, TB_SIZE>(dst, K, DIM, tid);
+
+    // load_K() will be in charge of incrementing global memory address
+    K += BLOCK_KV * DIM;
+  }
+
+  // we always commit a cp-async group regardless of whether there is a cp.async
+  // to maintain loop invariance.
+  asm volatile("cp.async.commit_group;");
+};
+auto load_V = ...;
+
+// prefetch K and V
+load_K(0);
+load_V(0);
+
+for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
+  // prefetch K for the next iteration
+  // now we have 3 prefetches in flight: K-V-K
+  load_K(kv_id + 1);
+
+  // wait for current K prefetch to finish
+  // now we have 2 prefetches in flight: V-K
+  asm volatile("cp.async.wait_group 2;");
+  __syncthreads();
+
+  // K shared->registers
+  // 1st MMA
+  ...
+
+  // prefetch V for the next iteration
+  // now we have 3 prefetches in flight: V-K-V
+  load_V(kv_id + 1);
+
+  // online softmax
+  ...
+
+  // wait for current V prefetch to finish
+  // now we have 2 prefetches in flight: K-V
+  asm volatile("cp.async.wait_group 2;");
+  __syncthreads();
+
+  // V shared->registers
+  // 2nd MMA
+  ...
+}
+```
+
+I experimented a bit with where to place `load_K/V` and `cp.async.wait_group` in the loop, and have found the above placement yielded the best performance. Although ultimately it depends on how the compiler rearranges and interleaves different instructions, the above placement makes sense: placing `load_V()` after the 1st MMA so that Tensor Cores can start working immediately when K data is in registers (instead of waiting for issuing V's `cp.async`) i.e. keeping Tensor Cores busy; `load_V()` is placed before online softmax to keep memory engine busy (while CUDA cores are working on online softmax). Again, the optimal placement can also depend a lot on the hardware e.g. relative speed of memory and compute, whether different memory and compute units can work at the same time...
+
 Version 3: [attention_v3.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v3.cu).
+
+{{< figure src="v3_warp_state_stats.png" alt="Warp state statistics of v3" caption="Warp state statistics of kernel v3." >}}
+
+Stall Long Scoreboard is now gone from Warp state statistics. I also had to reduce `BLOCK_KV` from 64 to 32 since we are using two buffers for K and V now, so that the total amount of shared memory usage remains the same.
 
 Kernel                         | TFLOPS | % of SOL
 -------------------------------|--------|---------
@@ -798,11 +876,41 @@ v3 (2-stage pipelining)        | 189.84 | 90.62%
 
 ## Version 4 - ldmatrix.x4 for K and V
 
-For the last two versions, I couldn't identify any optimization opportunities from profiling data (maybe just skill issue).
+For the last two versions, I couldn't identify any optimization opportunities from the profiling data (maybe just skill issue). The ideas mostly come from reading up random stuff and staring at the kernel.
 
-Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA tile. However, since we are handling a larger tile anyway, we can directly use `ldmatrix.x4` to issue fewer instructions. The trick is to select the appropriate 8x8 tiles and compute the row addresses correctly. There are two options: load `n16k16` tile, or `n8k32` tile.
+Previously, we use `ldmatrix.x2` for K and V since it naturally fits `n8k16` MMA tile. However, since we are handling a larger tile anyway, we can directly use `ldmatrix.x4` to issue fewer instructions. There are two options: load `n16k16` tile, or `n8k32` tile.
 
-TODO: figure for n16k16 and n8k32
+{{< figure src="ldmatrix_x4_B.svg" alt="ldmatrix.x4 for B" caption="Possible options for using ldmatrix.x4 for multiplicand B." >}}
+
+Is one option better than the other? We can try doing some analysis in terms of arithmetic intensity. At first glance, `n16k16` looks like a better option: 2 `ldmatrix.x4` (1 for A and 1 for B) to do 2 `mma.m16n8k16`; while `n8k32` option needs 3 `ldmatrix.x4` (2 for A and 1 for B) to do 2 `mma.m16n8k16`. If we are to implement this idea for a matmul kernel, this analysis would make sense. However, in our case, multiplicand A (query) is already in registers, thus we only need to consider loading cost of multiplicand B (key and value). This realization shows that the two options should be the same.
+
+You can definitely choose a different pattern to load K and V, but I hope at least the two options provided here are a bit more organized. To implement this idea, the key is to select the correct row addresses of 8x8 `ldmatrix` tiles.
+
+```cpp
+{
+  // pre-compute ldmatrix address for K, using n8k32 option
+  // [8x8][8x8][8x8][8x8]
+  const int row_off = lane_id % 8;
+  const int col_off = lane_id / 8 * 8;
+  K_smem_thread = swizzle<DIM * sizeof(nv_bfloat16)>(K_smem + (row_off * DIM + col_off) * sizeof(nv_bfloat16));
+}
+
+for (int kv_id = 0; kv_id < num_kv_iter; kv_id++) {
+  ...
+
+  // K shared->registers
+  // notice mma_id_d is incremented by 2
+  for (int mma_id_kv = 0; mma_id_kv < BLOCK_KV / MMA_N; mma_id_kv++)
+    for (int mma_id_d = 0; mma_id_d < DIM / MMA_K; mma_id_d += 2) {
+      uint32_t addr = K_smem_thread + (kv_id % 2) * (2 * BLOCK_KV * DIM * sizeof(nv_bfloat16));
+      addr += mma_id_kv * MMA_N * DIM * sizeof(nv_bfloat16);  // row
+      addr ^= mma_id_d * MMA_K * sizeof(nv_bfloat16);  // col
+      ldmatrix_x4(K_rmem[mma_id_kv][mma_id_d], addr);
+    }
+
+  ...
+}
+```
 
 Version 4: [attention_v4.cu](https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v4.cu).
 
@@ -811,7 +919,7 @@ Kernel                         | TFLOPS | % of SOL
 v3 (2-stage pipelining)        | 189.84 | 90.62%
 v4 (`ldmatrix.x4` for K and V) | 194.33 | 92.76%
 
-I was quite surprised at the speedup. The only difference in this version is that we use 2x fewer `ldmatrix` instructions in the main loop. Yet, we obtain a non-trivial improvement, inching towards SOL.
+I was quite surprised at the speedup. The only difference in this version is that we use 2x fewer `ldmatrix` instructions in the main loop. Yet, we obtain a non-trivial improvement, inching towards SOL. I'm guessing since Tensor Cores and memory engine are so fast in newer GPUs, scheduling and issuing instructions can become a bottleneck!
 
 ## Version 5 - better pipelining
 
