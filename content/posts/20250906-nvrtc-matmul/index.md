@@ -342,6 +342,8 @@ void mma_m16n8k16(int A[4], int B[2], float D[4]) {
 
 Now our `atype` and `btype` for the MMA instruction is adaptive based on `TypeAB`! It's important that we use `static constexpr const char value[]` type so that the string is known at compile time, including its length (`char *value` is a pointer and its length is unknown to the compiler). Ignoring other potential challenges ahead, it looks like supporting other dtypes like INT8 and FP8 is straight-forward: I just need to add more dtype conversion rules for `Type_str` struct.
 
+Update: On a different machine with CUDA 12.4, it looks like `"C"` asm constraint is not recognized by the compiler. My main machine uses CUDA 12.9 toolchain. Perhaps you need a sufficiently new version of NVCC/NVRTC to support this.
+
 #### Epilogue
 
 The final thing we need to take care of is the epilogue: convert FP32 accumulate to BF16/FP16 and write the result to global memory. I took the easy route here: conditional code based on output dtype.
@@ -756,8 +758,6 @@ _TYPE_MAP = {
 }
 ```
 
-The `itemsize` attribute is used to make shared memory size calculation work nicely, just like a `torch.dtype` object.
+The `itemsize` attribute is used to make shared memory size calculation work nicely, just like a `torch.dtype` object. These are the **only new changes** we need to make our code work with INT4 MMA! I could verify that the result is correct, even though INT4 MMA is probably running in emulation mode for 5090.
 
-These are the **only new changes** we need to make our code work with INT4 MMA! I could verify that the result is correct. On A6000 (Ampere), I obtained the following results.
-
-
+To check the FLOPS of INT4 MMA, I rented a 4090 instance online.
