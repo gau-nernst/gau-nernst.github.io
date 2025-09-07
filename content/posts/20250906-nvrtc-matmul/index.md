@@ -3,13 +3,13 @@ date = '2025-09-06T15:25:20+08:00'
 title = 'Use NVRTC to explore MMA instruction variants'
 url = 'nvrtc-matmul'
 +++
-Recently I tweeted about realistic Speed-of-Light (SOL) of 5090 and RTX PRO 6000 for some dtypes, and [mobicham asked me about FP8 MMA with FP16 accumulation](https://x.com/mobicham/status/1963540008947617947). I of last year would turn to Triton for this - it's trivial to change the accumulation dtype of [tl.dot()](https://triton-lang.org/main/python-api/generated/triton.language.dot.html). However, I roughly know how to write a fast matmul kernel now, so why not do it myself! In addition, I have been tinkering around with [`torch.cuda._compile_kernel()`](https://github.com/pytorch/pytorch/pull/151484), which compiles CUDA kernels super fast via [NVRTC](https://docs.nvidia.com/cuda/nvrtc/index.html). This seems ideal for JIT-compiled kernels and enumerating all possible permutations of the MMA instruction.
+Recently I tweeted about realistic Speed-of-Light (SOL) of 5090 and RTX PRO 6000 for some dtypes, and [mobicham asked me about FP8 MMA with FP16 accumulation](https://x.com/mobicham/status/1963540008947617947). I of last year would turn to Triton for this - it's trivial to change the accumulation dtype of [tl.dot()](https://triton-lang.org/main/python-api/generated/triton.language.dot.html). However, I roughly know how to write a fast matmul kernel now, so why not do it myself! In addition, I have been tinkering around with [`torch.cuda._compile_kernel()`](https://github.com/pytorch/pytorch/pull/151484), which compiles CUDA kernels super fast via [NVRTC](https://docs.nvidia.com/cuda/nvrtc/index.html). This seems ideal for JIT-compiled kernels and trying out all possible variants of the MMA instruction.
 
-What are the alternatives for authoring CUDA C++ kernels with PyTorch? The [standard approach](https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html) is to write everything in C++, expose a Python binding or register a PyTorch custom op, and build it as a native extension for Python. To try all possible variants of MMA, I would need to either make a lot of duplicate code, or deal with C++ template hell. It's also terribly slow to compile a PyTorch C++ extension. [torch.utils.cpp_extension.load/load_inline()](https://docs.pytorch.org/docs/stable/cpp_extension.html#torch.utils.cpp_extension.load_inline) can be used to handle the former issue: it JIT-compiles the provided code using the same facility as `CUDAExtension`, so we can do some form of string manipulation in Python to codgen appropriate CUDA C++ code. However, the speed issue is not resolved.
+What are the alternatives for authoring CUDA C++ kernels with PyTorch? The [standard approach](https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html) is to write everything in C++, expose a Python binding or register a PyTorch custom op, and build it as a Python native extension. To write all possible variants of MMA, I would need to either make a lot of duplicate code, or deal with C++ template hell. It's also terribly slow to compile a PyTorch C++ extension. [torch.utils.cpp_extension.load/load_inline()](https://docs.pytorch.org/docs/stable/cpp_extension.html#torch.utils.cpp_extension.load_inline) can be used to handle the former issue: it JIT-compiles the provided code using the same facility as `CUDAExtension`, so we can do some form of string manipulation in Python to codgen appropriate CUDA C++ code. However, the speed issue is still there.
 
-You may ask, if I just want to try FP8 MMA with FP16 accumulation, why not use Triton like I mentioned from the start. Sometimes there are issues with Triton: the Triton version released with PyTorch 2.8.0 still has bugs around using FP8 inputs to `tl.dot()`. It was reportedly fixed in [triton-lang/triton#7409](https://github.com/triton-lang/triton/pull/7409), but perhaps it didn't get included in the latest stable release. And I don't want to build Triton from source just for this. Moreover, previously I wanted to play with INT4 MMA, but Triton did not (and still does not) support it - [triton-lang/triton#675](https://github.com/triton-lang/triton/issues/675).
+You may ask, if I just want to try FP8 MMA with FP16 accumulation, why not use Triton like I mentioned in the beginning. Sometimes there are issues with Triton: Triton 3.4.0 bundled with PyTorch 2.8.0 still has bugs around using FP8 inputs for `tl.dot()`. It was reportedly fixed in [triton-lang/triton#7409](https://github.com/triton-lang/triton/pull/7409), but perhaps the patch didn't make it for the 3.4 release cut. And I don't want to build Triton from source just for this. Moreover, previously I wanted to play with INT4 MMA, but Triton did not (and still does not) support it - [triton-lang/triton#675](https://github.com/triton-lang/triton/issues/675).
 
-[Cutlass](https://github.com/NVIDIA/cutlass) is another reasonable option, and they do support FP8 with FP16 accumulation, as well as INT4 MMA for my past interest. If I need a proper kernel for production, I would probably use Cutlass'. But in the mean time, let's find an excuse to build my own templated matmul with NVRTC.
+[Cutlass](https://github.com/NVIDIA/cutlass) is another reasonable option, and they do support FP8 with FP16 accumulation, as well as INT4 MMA for my past interest. If I need a proper kernel for production, I would probably use Cutlass. But in the mean time, let's find an excuse to build my own templated matmul with NVRTC.
 
 {{< toc >}}
 
@@ -132,9 +132,9 @@ This is awesome for developing kernels, especially for autotuning kernels params
 
 ### Development workflow
 
-The [current _compile_kernel()](https://github.com/pytorch/pytorch/blob/v2.8.0/torch/cuda/__init__.py#L1736-L1743) accepts two key arguments for passing the kernel code: `kernel_source` and `header_code`. The former must start with the kernel code (and with C linkage i.e. `extern "C"`), while the latter can contain `#include` statements and other function / variable declarations and definitions. There is no big difference in how the two are treated - they are concatenated later anyway before passing to NVRTC.
+The [current _compile_kernel()](https://github.com/pytorch/pytorch/blob/v2.8.0/torch/cuda/__init__.py#L1736-L1743) accepts two important arguments for passing the kernel code: `kernel_source` and `header_code`. The former must start with the kernel code (and with C linkage i.e. `extern "C"`), while the latter can contain `#include` statements and other function / variable declarations and definitions. There is no big difference in how the two are treated - they are later concatenated before passing to NVRTC.
 
-Having C linkage means that our kernel can't use C++ template. This is fine since we can declare template parameters as global `constexpr` variables or type aliases in the header code, and replace those definitions at compile time. The kernel content remains exactly the same.
+Having C linkage means that our kernel can't be a C++ function template. This is fine since we can declare template parameters as global `constexpr` variables or type aliases in the header code, and replace those definitions at compile time. The kernel content remains exactly the same.
 
 ```cpp
 // before
@@ -225,11 +225,11 @@ void matmul_kernel(const TypeInput *A,
 }
 ```
 
-The header section in `kernel.cu` only exists to ensure syntax highlighting and autocompletion work. When we compile the kernel, we can generate the header dynamically depending on the required parameters. You can see my full example here: https://github.com/gau-nernst/gn-kernels/tree/aa0a6794/gn_kernels/cuda_mm.
+The header section in `kernel.cu` only exists to ensure syntax highlighting and autocompletion work during development with VSCode. When we compile the kernel, we can generate the header dynamically depending on the required parameters. You can see my full example here: https://github.com/gau-nernst/gn-kernels/tree/2263c25/gn-kernels/cuda_mm.
 
 ### Missing CUDA and C++ headers :(
 
-It's pretty standard to include `<cuda_bf16.h>` and/or `<cuda_fp16.h>` headers to work with BF16/FP16 dtypes. However, trying to compile code using those headers with NVRTC results in errors.
+It's pretty standard to include `<cuda_bf16.h>` and `<cuda_fp16.h>` headers to work with BF16/FP16 dtypes. However, trying to compile code using those headers with NVRTC results in errors.
 
 ```
 E           RuntimeError: Kernel compilation failed:
@@ -239,7 +239,7 @@ E             #include <cuda_bf16.h>
 
 It turns out NVRTC doesn't automatically include header search paths like NVCC does. It's straight-forward to fix - include `/usr/local/cuda/include`, which is where my CUDA Toolkit installation stores its headers, in `_compile_kernel()`'s `cuda_include_dirs` argument. We can also use `torch.utils.cpp_extension.include_paths("cuda")` to automatically obtain CUDA include paths.
 
-In my original matmul kernel, I also extensively used `uint32_t`/`int8_t` from `<cstdint>`. This also doesn't work with NVRTC due to missing headers. I could use their original native types e.g. `unsigned int`, `signed char`, which I did, but it doesn't solve the root issue of missing C++ standard library headers. I also need `std::is_same_v` for writing asm PTX for various dtypes (which will be covered later). I did try including those headers from GCC, but they didn't work with NVRTC.
+In my original matmul kernel, I also extensively used `uint32_t`/`int8_t` from `<cstdint>`. This also doesn't work with NVRTC as it can't find that header. I could use their original native types e.g. `unsigned int`, `signed char`, which I did, but it doesn't solve the root issue of missing C++ standard library headers. I also need `std::is_same_v` for selecting different codepaths based on the input dtype. I did try including those headers from GCC, but they didn't work with NVRTC.
 
 Fortunately, I remembered there was CUDA C++ Standard Library - https://nvidia.github.io/cccl/libcudacxx/standard_api.html, which provides implementations of C++ standard features for both device and host code. Usage is simple: replace the C++ standard headers with their CUDA equivalent, and add `cuda::` prefix as needed.
 
@@ -456,7 +456,7 @@ Sadly we can't quite use a single `asm volatile` statement for everything since 
 
 #### Epilogue (again!)
 
-Again, let's assume the user is sensible, so only the following combinations are permitted:
+Let's assume the user is sensible, so only the following combinations are permitted:
 - `TypeAcc=float` (can be FP16/BF16/FP8 MMA) -> `TypeC` can only be BF16 or FP16 -> we can use the previous code.
 - `TypeAcc=int` (INT8 MMA) -> `TypeC` can only be INT32 -> no dtype conversion needed.
 
@@ -497,7 +497,7 @@ Except using `TypeAcc` for `C_rmem` is no longer valid. Or you can argue that we
 + int C_rmem[WARP_M / MMA_M][WARP_N / MMA_N][sizeof(TypeAcc)] = {};  // 4 for FP32/INT32, 2 for FP16
 ```
 
-There are no changes to `cp.async` and `ldmatrix` code, since they only involve A and B. `mma` does require new changes since FP16 accumulation only uses 2 registers. We need a separate `asm volatile` statement in this case.
+There are no changes to `cp.async` and `ldmatrix` code, since they only involve A and B. `mma` does require modifications since FP16 accumulation only uses 2 registers. We need a separate `asm volatile` statement in this case.
 
 ```cpp
 template <typename TypeAB, typename TypeAcc>
@@ -550,7 +550,7 @@ Notice all C++ variables use `int` now, since we treat everything as 32-bit regi
 
 Anyway, our last piece is the epilogue, as always. Our new assumptions are:
 - (unchanged) `TypeAcc=float` (can be FP16/BF16/FP8 MMA) -> `TypeC` can only be BF16 or FP16.
-- (new) `TypeAcc=TypeC`: this covers the original INT32 case for INT8 MMA, as well as the new FP16 accumulation, which requires FP16 output dtype. In either cases, no dtype conversion is required.
+- (new) `TypeAcc=TypeC`: this covers the original INT32 case for INT8 MMA, as well as the new FP16 accumulation, which assumes FP16 output dtype. In either cases, no dtype conversion is required.
 
 ```cpp
 const int *acc = C_rmem[mma_id_m][mma_id_n];
@@ -581,7 +581,7 @@ This concludes our templated matmul in the CUDA C++ side!
 
 NVRTC integration in the Python side is pretty straight-forward. We map the original PyTorch dtype to its corresponding C++ dtype, such as from `torch.float32` to `float` and `torch.bfloat16` to `nv_bfloat16`. The kernel code is read from `kernel.cu`, split based on a pre-defined marker, and the header code is generated using a Python string template, as discussed previously.
 
-One problem I noticed why working with `torch.cuda._compile_kernel()` is that it doesn't handle kernels using more than 48kb shared memory correctly. According to NVIDIA's rules, such kernels require explicit opt-in via `cudaFuncSetAttribute()`. I do have this in my original matmul kernel https://github.com/gau-nernst/learn-cuda/blob/4038627c/02b_matmul_tensorop/common.h#L88. Looking inside `_compile_kernel()` internals, I figured I could do the same thing with `libcuda`.
+One problem I noticed while working with `torch.cuda._compile_kernel()` is that it doesn't handle kernels using more than 48kb shared memory correctly. According to NVIDIA's rules, such kernels require explicit opt-in via `cudaFuncSetAttribute()`. I do have this in my original matmul kernel https://github.com/gau-nernst/learn-cuda/blob/4038627c/02b_matmul_tensorop/common.h#L88. Looking inside `_compile_kernel()` internals, I figured I could do the same thing with `libcuda`.
 
 ```python
 from torch.cuda._utils import _check_cuda, _get_cuda_library
@@ -629,8 +629,8 @@ kernel.run(A, B)
 ## Benchmark results
 
 For benchmarking, I'm interested in two things.
-1. How good are my kernels compared to the ones in PyTorch (backed by CuBLAS/Cutlass...).
-2. How fast is FP8 MMA with FP16 accumulation on 5090 (the original motivation for this whole work).
+1. How good my kernels are compared to the ones in PyTorch (backed by CuBLAS/Cutlass...).
+2. How fast FP8 MMA with FP16 accumulation is on 5090 (the original motivation for this whole work).
 
 ### Compare against PyTorch
 
@@ -643,9 +643,9 @@ I obtained the following results for M=N=K=8192, with 5090 @ 600W. The unit is T
 
 Kernel             | BF16 | INT8 | FP8
 -------------------|------|------|-----
-PyTorch (eager)    | 230  | 781  | 473
-PyTorch (compiled) | 238  | 782  | (error)
-Mine               | 233  | 796  | 465
+PyTorch (eager)    | 230  | 678  | 473
+PyTorch (compiled) | 238  | 680  | (error)
+Mine               | 233  | 736  | 465
 
 There were some lowering errors with `torch.compile()` for tensor-wise scaling `torch._scaled_mm()`, hence I omitted it. It works fine for row-wise scaling though.
 
@@ -670,9 +670,9 @@ PRO 6000 | Blackwell (sm120) | 503.8 | 503.8
 
 Source: [Turing Whitepaper](https://images.nvidia.com/aem-dam/en-zz/Solutions/design-visualization/technologies/turing-architecture/NVIDIA-Turing-Architecture-Whitepaper.pdf), [Ampere Whitepaper](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.pdf), [Ada Whitepaper](https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf), [Ada Pro Whitepaper](https://images.nvidia.com/aem-dam/en-zz/Solutions/technologies/NVIDIA-ADA-GPU-PROVIZ-Architecture-Whitepaper_1.1.pdf), [Blackwell Whitepaper](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf), [Blackwell Pro Whitepaper](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/NVIDIA-RTX-Blackwell-PRO-GPU-Architecture-v1.0.pdf)
 
-If we compare FP16 FLOPS against those of their professional counterparts, which use the same chips, we can see that it's more like FP16 accumulation is the full FLOPS, while the FP32 accumulation is the "nerfed" version. Some people have exploited this: SageAttention (https://arxiv.org/abs/2410.02367) uses FP16 accumulate for `P @ V` matmul, GemLite (https://github.com/mobiusml/gemlite) has FP16 matmul with FP16 accumulate.
+If we compare FP16 FLOPS against those of the professional counterparts, which use the same chips, we can see that it's more like FP16 accumulation has the full FLOPS, while the FP32 accumulation is the "nerfed" version. Some people have exploited this: SageAttention (https://arxiv.org/abs/2410.02367) uses FP16 accumulate for `P @ V` matmul, GemLite (https://github.com/mobiusml/gemlite) has FP16 matmul with FP16 accumulate.
 
-When Ada GPUs were introduced with FP8 MMA in 2022, many noticed that there was also a row mentioning "**Peak FP8 Tensor TFLOPS with FP16 Accumulate**" in its whitepaper. It also has doubled FLOPS compared to the FP32 accumulate counterpart. However, there was no way to access this feature! If I remember correctly, I did try it with Triton last year, but didn't observe any speedup. Some discussions in the GPU MODE Discord group concluded that perhaps it was false information, since it was not mentioned anywhere else by NVIDIA, except that little row in the whitepaper.
+When Ada GPUs were introduced with FP8 MMA in 2022, many noticed that there was a row mentioning "**Peak FP8 Tensor TFLOPS with FP16 Accumulate**" in its whitepaper. It also has doubled FLOPS compared to the FP32 accumulate version. However, there was no way to access this feature! If I remember correctly, I did try it with Triton last year, but didn't observe any speedup. Some discussions in the GPU MODE Discord group concluded that perhaps it was false information, since it was not mentioned anywhere else by NVIDIA, except for that little row in the whitepaper.
 
 Fast forward to 2025 (more than 2 years later!), there was this small line in [PTX 8.7 release notes](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#changes-in-ptx-isa-version-8-7), which were shipped with CUDA 12.8.
 
@@ -691,12 +691,73 @@ FP8   | 465 | 692
 
 We didn't quite get 2x speedup since the GPU is probably power-limited. But we get quite close to the realistic Speed-of-Light of PRO 6000 that I previously documented here https://github.com/gau-nernst/gn-kernels/blob/2263c25f/README.md#realistic-sol.
 
-## Bonus: INT4 MMA
-
-INT4 Tensor Cores were removed since Hopper, so there aren't many reasons to use INT4 MMA today.
+An interesting observation is that since we use 2x fewer registers for the accumulator, we can double either `BLOCK_M` or `BLOCK_N`, which I did when doing manual tuning of the kernel.
 
 ## Closing remarks
 
-To answer the original question of whether FP8 MMA with FP16 accumulate is much faster than that with FP32 accumulate, the answer is yes! And it's also slightly faster than MXFP8 MMA on 5090, which is also not "nerfed", but I suppose it's wasting power on block scaling circuits.
+To answer the original question of whether FP8 MMA with FP16 accumulate is much faster than that with FP32 accumulate, the answer is yes! And it's also slightly faster than MXFP8 MMA on 5090, which is also not "nerfed". I suppose the MXFP8 MMA instruction is spending some extra energy on the block scaling circuitry.
 
 Thanks [msaroufim](https://x.com/marksaroufim) for bringing NVRTC to PyTorch. Though the `ctypes` wrapper of NVRTC is pretty straight-forward, and I can probably implement something similar by myself, I only know about it thanks to Mark, despite NVRTC being a very old technology. It's also very convenient when it's a PyTorch built-in, so I can focus on writing kernels.
+
+## Bonus: INT4 MMA
+
+I did mention that I was interested in exploring INT4 MMA last year. However, since INT4 Tensor Cores were removed since Hopper, there aren't many reasons to use INT4 MMA today. But let's imagine we are still in 2024, and see how we can integrate it with our current templated matmul.
+
+The first complexity is that there is no native INT4 type in C++ provided by NVIDIA. Even if I define one by myself, it doesn't quite work in C++ since such type with be half a byte. To circumvent this problem, perhaps we can define `int4x2` instead - a type of two INT4 elements packed into a byte. However, since `MMA_K` is computed based on `sizeof(TypeAB)`, without any changes, `MMA_K` would be 32, the same value as the one in INT8 and FP8, even though we want the `m16n8k64` MMA instruction.
+
+Ignoring the MMA instruction for now, let's think about what would happen if we use `MMA_K=32` for the hypothetical `int4x2` type. All calculations for addresses and `cp.async`/`ldmatrix` would work as expected since the physical MMA shape is still the same - 32-byte wide! Hence, we can go ahead with the `int4x2` type, and add an extra MMA case for this type.
+
+```cpp
+// new types
+struct int4x2 { char data; };
+struct uint4x2 { char data; };
+
+// PTX type
+template<> struct Type_str<int4x2> { static constexpr const char value[] = "s4"; };
+template<> struct Type_str<uint4x2> { static constexpr const char value[] = "u4"; };
+
+template <typename TypeAB, typename TypeAcc>
+__device__ inline
+void mma(int A[4], int B[2], int *C) {
+  // floating point MMA cases
+  ...
+
+  // special case for INT4 MMA. override MMA shape
+  else if constexpr (cuda::std::is_same_v<TypeAB, int4x2> || cuda::std::is_same_v<TypeAB, uint4x2>)
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.satfinite.s32.%14.%14.s32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "C"(Type_str<TypeAB>::value));
+
+  // INT8 MMA case
+  ...
+}
+```
+
+From the Python side, we can define a "sentinel" object to signify INT4 types.
+
+```python
+class FakeType:
+    itemsize = 1
+
+int4x2 = FakeType()
+uint4x2 = FakeType()
+
+_TYPE_MAP = {
+    ...
+    int4x2: "int4x2",
+    uint4x2: "uint4x2",
+}
+```
+
+The `itemsize` attribute is used to make shared memory size calculation work nicely, just like a `torch.dtype` object.
+
+These are the **only new changes** we need to make our code work with INT4 MMA! I could verify that the result is correct. On A6000 (Ampere), I obtained the following results.
+
+
