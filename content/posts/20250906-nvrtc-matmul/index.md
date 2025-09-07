@@ -272,7 +272,7 @@ So far we have discussed about the engineering side of compiling kernels with NV
 
 The `TypeAB` and `TypeAcc` will dictate what MMA instruction we use. The kernel hyperparameters are used for autotuning to find the best kernel for a given problem shape (and dtypes). Both A and B are K-major, and C is N-major.
 
-### Support FP16 and BF16 MMA
+### FP16 and BF16 MMA
 
 I used my old matmul kernel from here, https://github.com/gau-nernst/learn-cuda/blob/4038627c/02b_matmul_tensorop/matmul_v6.cu, as the starting point. It's a pretty standard Ampere BF16 matmul kernel using `cp.async` and `ldmatrix`. To extend support for FP16, I replace `nv_bfloat16` with `TypeAB`, and everything should work correctly for both BF16 (`nv_bfloat16` from `<cuda_bf16.h>`) and FP16 (`half` from `<cuda_fp16.h>`), except the MMA instruction and epilogue code. Currently the MMA instruction is hard-coded to BF16.
 
@@ -361,7 +361,7 @@ else if constexpr (cuda::std::is_same_v<TypeC, half>) {
 
 This assumes output dtype can only be BF16 or FP16, which is fine for now. I tried looking at the [cvt](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cvt) instruction to find a generic way to convert dtypes, but it doesn't seem to worth the effort. Only FP32->FP16/BF16/FP8 conversion has a specialized convert-and-pack version, and not all TypeAcc->TypeC are possible, at least directly e.g. INT32->FP8 (though this conversion doesn't quite make sense). In addition, I would need to allocate registers of different dtypes depending on `TypeC`, and the `asm volatile` statement can potentially be different depending on how I unpack and pack a register. So let's assume the user (i.e. me) is sensible and only output FP16 or BF16 for now.
 
-### Support INT8 and FP8 MMA
+### INT8 and FP8 MMA
 
 BF16 and FP16 have the same bit-width, so supporting both of them is simple. INT8 and FP8 have smaller bit-width, hence we need to be very careful about size and address calculations.
 - For **global memory addresses**, since we use C++ pointers of their corresponding types, address calculation works as expected.
@@ -421,7 +421,7 @@ template<> struct MMA_shape_str<1> { static constexpr const char value[] = "m16n
 
 template <typename TypeAB, typename TypeAcc>
 __device__ inline
-void mma(int A[4], int B[2], TypeAcc *C) {
+void mma(int A[4], int B[2], TypeAcc C[4]) {
   // m16n8k16 for FP16/BF16
   // m16n8k32 for FP8/INT8
   using shape = MMA_shape_str<sizeof(TypeAB)>;
@@ -432,10 +432,10 @@ void mma(int A[4], int B[2], TypeAcc *C) {
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
                 "{%10, %11, %12, %13};"
-                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]),
                   "C"(shape::value), "C"(Type_str<TypeAB>::value));
 
   else if constexpr (cuda::std::is_same_v<TypeAcc, int>)
@@ -444,10 +444,10 @@ void mma(int A[4], int B[2], TypeAcc *C) {
                 "{%4, %5, %6, %7}, "
                 "{%8, %9}, "
                 "{%10, %11, %12, %13};"
-                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
                 : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                   "r"(B[0]), "r"(B[1]),
-                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3]),
                   "C"(shape::value), "C"(Type_str<TypeAB>::value));
 }
 ```
@@ -479,9 +479,9 @@ else if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<
 }
 ```
 
-It's getting kinda ugly but oh well, we are not writing a compiler. And not that I have a knowledge to write one.
+It's getting kinda ugly but oh well, we are not writing a compiler. And not that I have the knowledge and skill to write one.
 
-### Support MMA with FP16 accumulation
+### MMA with FP16 accumulation
 
 This is the trickiest part. Previously, we didn't need to change the number of registers per MMA tile per thread, because they remain the same. But with FP16 accumulation, accumulator only needs 2x 32-bit registers per thread, instead of 4x (for each MMA tile). Well, we can do this.
 
@@ -490,14 +490,213 @@ This is the trickiest part. Previously, we didn't need to change the number of r
 + TypeAcc C_rmem[WARP_M / MMA_M][WARP_N / MMA_N][sizeof(TypeAcc)] = {};  // 4 for FP32/INT32, 2 for FP16
 ```
 
-Except using `TypeAcc` for `C_rmem` is no longer valid.
+Except using `TypeAcc` for `C_rmem` is no longer valid. Or you can argue that we can use `half` for `C_rmem` and keep `[4]`. But for inline assembly, the inputs need to be of elementary types. In the pursuit of simplicity, and considering that everything is a 32-bit register, we will use `int` for accumulator registers regardless of `TypeAcc`
 
-Although this goes against my initial remark against C++ template hell, I think this is still reasonable and readable. Perhaps an alternative would be to build the desired PTX MMA instruction string in Python, and wrap it around something like `mma()` function that can be injected via header code.
+```diff
+- TypeAcc C_rmem[WARP_M / MMA_M][WARP_N / MMA_N][4] = {};
++ int C_rmem[WARP_M / MMA_M][WARP_N / MMA_N][sizeof(TypeAcc)] = {};  // 4 for FP32/INT32, 2 for FP16
+```
 
-### Bonus: Support INT4 MMA
+There are no changes to `cp.async` and `ldmatrix` code, since they only involve A and B. `mma` does require new changes since FP16 accumulation only uses 2 registers. We need a separate `asm volatile` statement in this case.
 
-INT4 Tensor Cores were removed since Hopper, so there aren't many reasons to investigate INT4 MMA today.
+```cpp
+template <typename TypeAB, typename TypeAcc>
+__device__ inline
+void mma(int A[4], int B[2], int *C) {
+  // m16n8k16 for FP16/BF16
+  // m16n8k32 for FP8/INT8
+  using shape = MMA_shape_str<sizeof(TypeAB)>;
+
+  if constexpr (cuda::std::is_same_v<TypeAcc, float>)
+    asm volatile("mma.sync.aligned.%14.row.col.f32.%15.%15.f32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "C"(shape::value), "C"(Type_str<TypeAB>::value));
+
+  // new case
+  else if constexpr (cuda::std::is_same_v<TypeAcc, half>)
+    asm volatile("mma.sync.aligned.%10.row.col.f16.%11.%11.f16 "
+                "{%0, %1}, "
+                "{%2, %3, %4, %5}, "
+                "{%6, %7}, "
+                "{%8, %9};"
+                : "=r"(D[0]), "=r"(D[1])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(D[0]), "r"(D[1]),
+                  "C"(shape::value), "C"(Type_str<TypeAB>::value));
+
+  else if constexpr (cuda::std::is_same_v<TypeAcc, int>)
+    asm volatile("mma.sync.aligned.%14.row.col.satfinite.s32.%15.%15.s32 "
+                "{%0, %1, %2, %3}, "
+                "{%4, %5, %6, %7}, "
+                "{%8, %9}, "
+                "{%10, %11, %12, %13};"
+                : "=r"(D[0]), "=r"(D[1]), "=r"(D[2]), "=r"(D[3])
+                : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                  "r"(B[0]), "r"(B[1]),
+                  "r"(D[0]), "r"(D[1]), "r"(D[2]), "r"(D[3]),
+                  "C"(shape::value), "C"(Type_str<TypeAB>::value));
+}
+```
+
+Notice all C++ variables use `int` now, since we treat everything as 32-bit registers. This starts to get complicated, which goes against my initial remark against C++ template hell. But I think it is still somewhat reasonable and readable. Perhaps an alternative would be to build the desired PTX MMA instruction string in Python, and wrap it around something like `mma()` function that can be injected via header code.
+
+Anyway, our last piece is the epilogue, as always. Our new assumptions are:
+- (unchanged) `TypeAcc=float` (can be FP16/BF16/FP8 MMA) -> `TypeC` can only be BF16 or FP16.
+- (new) `TypeAcc=TypeC`: this covers the original INT32 case for INT8 MMA, as well as the new FP16 accumulation, which requires FP16 output dtype. In either cases, no dtype conversion is required.
+
+```cpp
+const int *acc = C_rmem[mma_id_m][mma_id_n];
+
+if constexpr (cuda::std::is_same_v<TypeAcc, TypeC>) {
+  // no conversion needed
+  // either 4-byte (FP32/INT32) or 2-byte (FP16) per elem
+  // which we pack 2 elems into 8-byte or 4-byte respectively
+  using write_type = cuda::std::conditional_t<sizeof(TypeC) == 4, long, int>;
+  reinterpret_cast<write_type *>(C_gmem + (row + 0) * N + col)[0] = reinterpret_cast<const write_type *>(acc)[0];
+  reinterpret_cast<write_type *>(C_gmem + (row + 8) * N + col)[0] = reinterpret_cast<const write_type *>(acc)[1];
+}
+else if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<TypeC, nv_bfloat16>) {
+  const float *acc_fp32 = reinterpret_cast<const float *>(acc);
+  reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 0) * N + col)[0] = __float22bfloat162_rn({acc_fp32[0], acc_fp32[1]});
+  reinterpret_cast<nv_bfloat162 *>(C_gmem + (row + 8) * N + col)[0] = __float22bfloat162_rn({acc_fp32[2], acc_fp32[3]});
+}
+else if constexpr (cuda::std::is_same_v<TypeAcc, float> && cuda::std::is_same_v<TypeC, half>) {
+  const float *acc_fp32 = reinterpret_cast<const float *>(acc);
+  reinterpret_cast<half2 *>(C_gmem + (row + 0) * N + col)[0] = __float22half2_rn({acc_fp32[0], acc_fp32[1]});
+  reinterpret_cast<half2 *>(C_gmem + (row + 8) * N + col)[0] = __float22half2_rn({acc_fp32[2], acc_fp32[3]});
+}
+```
+
+This concludes our templated matmul in the CUDA C++ side!
+
+### NVRTC integration
+
+NVRTC integration in the Python side is pretty straight-forward. We map the original PyTorch dtype to its corresponding C++ dtype, such as from `torch.float32` to `float` and `torch.bfloat16` to `nv_bfloat16`. The kernel code is read from `kernel.cu`, split based on a pre-defined marker, and the header code is generated using a Python string template, as discussed previously.
+
+One problem I noticed why working with `torch.cuda._compile_kernel()` is that it doesn't handle kernels using more than 48kb shared memory correctly. According to NVIDIA's rules, such kernels require explicit opt-in via `cudaFuncSetAttribute()`. I do have this in my original matmul kernel https://github.com/gau-nernst/learn-cuda/blob/4038627c/02b_matmul_tensorop/common.h#L88. Looking inside `_compile_kernel()` internals, I figured I could do the same thing with `libcuda`.
+
+```python
+from torch.cuda._utils import _check_cuda, _get_cuda_library
+
+@dataclasses.dataclass
+class MatmulKernel:
+    ...
+
+    def __post_init__(self) -> None:
+        ...
+
+        self.smem_size = (BM + BN) * BK * self.in_dtype.itemsize * self.num_stages
+
+        if self.smem_size >= 48 * 1024:
+            libcuda = _get_cuda_library()
+            _check_cuda(libcuda.cuFuncSetAttribute(self.kernel.func, 8, self.smem_size))
+```
+
+`8` is the value of `cudaFuncAttributeMaxDynamicSharedMemorySize` enum as documented here - https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html. I opened a PR upstream for this ([pytorch/pytorch#162328](https://github.com/pytorch/pytorch/pull/162328)). Hopefully it will be merged eventually.
+
+In the end, my templated matmul kernel can be called as follows, which I think is pretty neat.
+
+```python
+import torch
+from gn_kernels.cuda_mm import MatmulKernel
+
+kernel = MatmulKernel(
+    in_dtype=torch.float8_e4m3fn,
+    out_dtype=torch.bfloat16,
+    acc_dtype=torch.float32,
+    block_mnk=(128, 128, 128),
+    group_m=32,
+    warp_mn=(2, 2),
+    num_stages=1,
+)
+
+M, N, K = 8192, 8192, 8192
+A = torch.randn(M, K, device="cuda").to(kernel.in_dtype)
+B = torch.randn(N, K, device="cuda").to(kernel.in_dtype).T
+kernel.run(A, B)
+```
+
+`in_dtype`, `out_dtype`, and `acc_dtype` can be changed as needed, though `out_dtype` and `acc_dtype` combinations should be sensible! There are no checks against invalid PTX, but that would raise Python runtime error when NVRTC is invoked, so that is fine anyway.
+
+## Benchmark results
+
+For benchmarking, I'm interested in two things.
+1. How good are my kernels compared to the ones in PyTorch (backed by CuBLAS/Cutlass...).
+2. How fast is FP8 MMA with FP16 accumulation on 5090 (the original motivation for this whole work).
+
+### Compare against PyTorch
+
+Not all MMA variants can be accessed via PyTorch. I only compare the most readily available ones:
+1. BF16 matmul via `torch.mm()`
+2. INT8 matmul via `torch.mm()`
+3. FP8 matmul via `torch._scaled_mm()` with tensor-wise scaling. This is not quite fair since it involves additional output scaling in the epilogue, but its runtime should be miniscule compared to the time spent in the MMA main loop.
+
+I obtained the following results for M=N=K=8192, with 5090 @ 600W. The unit is TFLOPS.
+
+Kernel             | BF16 | INT8 | FP8
+-------------------|------|------|-----
+PyTorch (eager)    | 230  | 781  | 473
+PyTorch (compiled) | 238  | 782  | (error)
+Mine               | 233  | 796  | 465
+
+There were some lowering errors with `torch.compile()` for tensor-wise scaling `torch._scaled_mm()`, hence I omitted it. It works fine for row-wise scaling though.
+
+Anyway, it looks like my kernel performs pretty well across different dtypes! And the compile time is lightning fast thanks to NVRTC. However, it was pretty weird that my kernels perform best when `num_stages=1`, indicating that perhaps there is something wrong with how I implement pipelining. But let's leave that investigation for another day...
+
+### FP8 MMA with FP16 accumulation
+
+#### Story time
+
+Before getting to the results, let me give you some background context on FP16 accumulation. GPU enthusiasts have always been noticing that on consumer GPUs, FP16 MMA with FP16 accumulation has doubled FLOPS compared to the standard FP32 accumulation. This can be observed since Tensor Cores were first introduced in consumer GPUs.
+
+GPU      | Generation | FP16 w/ FP32 acc | FP16 w/ FP16 acc
+---------|------------|------------------|-----------------
+2080 Ti  | Turing (sm75) |  56.9 | 113.8
+6000     | Turing (sm75) | 130.5 | 130.5
+3090     | Ampere (sm86) |  71.0 | 142.0
+A6000    | Ampere (sm86) | 154.8 | 154.8
+4090     | Ada (sm89) | 165.2 | 330.3
+6000 Ada | Ada (sm89) | 364.2 | 364.2
+5090     | Blackwell (sm120) | 209.5 | 419.0
+PRO 6000 | Blackwell (sm120) | 503.8 | 503.8
+
+Source: [Turing Whitepaper](https://images.nvidia.com/aem-dam/en-zz/Solutions/design-visualization/technologies/turing-architecture/NVIDIA-Turing-Architecture-Whitepaper.pdf), [Ampere Whitepaper](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.pdf), [Ada Whitepaper](https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf), [Ada Pro Whitepaper](https://images.nvidia.com/aem-dam/en-zz/Solutions/technologies/NVIDIA-ADA-GPU-PROVIZ-Architecture-Whitepaper_1.1.pdf), [Blackwell Whitepaper](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf), [Blackwell Pro Whitepaper](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/NVIDIA-RTX-Blackwell-PRO-GPU-Architecture-v1.0.pdf)
+
+If we compare FP16 FLOPS against those of their professional counterparts, which use the same chips, we can see that it's more like FP16 accumulation is the full FLOPS, while the FP32 accumulation is the "nerfed" version. Some people have exploited this: SageAttention (https://arxiv.org/abs/2410.02367) uses FP16 accumulate for `P @ V` matmul, GemLite (https://github.com/mobiusml/gemlite) has FP16 matmul with FP16 accumulate.
+
+When Ada GPUs were introduced with FP8 MMA in 2022, many noticed that there was also a row mentioning "**Peak FP8 Tensor TFLOPS with FP16 Accumulate**" in its whitepaper. It also has doubled FLOPS compared to the FP32 accumulate counterpart. However, there was no way to access this feature! If I remember correctly, I did try it with Triton last year, but didn't observe any speedup. Some discussions in the GPU MODE Discord group concluded that perhaps it was false information, since it was not mentioned anywhere else by NVIDIA, except that little row in the whitepaper.
+
+Fast forward to 2025 (more than 2 years later!), there was this small line in [PTX 8.7 release notes](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#changes-in-ptx-isa-version-8-7), which were shipped with CUDA 12.8.
+
+> Extends `mma` instructions to support `.f16` type accumulator and shape `.m16n8k16` with FP8 types `.e4m3` and `.e5m2`.
+
+Wow. So FP8 MMA with FP16 accumulation was real after all, but it took NVIDIA 2 years to official support it in PTX. Though I suppose if you are cracked enough, you can whisper SASS to the GPU to command it exactly what to do.
+
+#### FP16 accumulation speedup
+
+Story time ends here. Let's get back to our investigation. Specifying FP8 MMA with FP16 accumulation is simple with our templated matmul. Since we are already doing this, let's also compare FP16 MMA with FP32 and FP16 accumulate. The results were obtained with 5090 @ 600W, and M=N=K=8192. Unit is TFLOPS.
+
+dtype | FP32 accumulate | FP16 accumulate
+------|-----|-----
+FP16  | 233 | 350
+FP8   | 465 | 692
+
+We didn't quite get 2x speedup since the GPU is probably power-limited. But we get quite close to the realistic Speed-of-Light of PRO 6000 that I previously documented here https://github.com/gau-nernst/gn-kernels/blob/2263c25f/README.md#realistic-sol.
+
+## Bonus: INT4 MMA
+
+INT4 Tensor Cores were removed since Hopper, so there aren't many reasons to use INT4 MMA today.
 
 ## Closing remarks
 
-Thanks to [msaroufim](https://x.com/marksaroufim) for bringing this to PyTorch. Though the `ctypes` wrapper of NVRTC is pretty straight-forward, and I can probably implement something similar by myself, it's very convenient when it's a PyTorch built-in, so I can focus on writing kernels. It also helps with distributing kernels
+To answer the original question of whether FP8 MMA with FP16 accumulate is much faster than that with FP32 accumulate, the answer is yes! And it's also slightly faster than MXFP8 MMA on 5090, which is also not "nerfed", but I suppose it's wasting power on block scaling circuits.
+
+Thanks [msaroufim](https://x.com/marksaroufim) for bringing NVRTC to PyTorch. Though the `ctypes` wrapper of NVRTC is pretty straight-forward, and I can probably implement something similar by myself, I only know about it thanks to Mark, despite NVRTC being a very old technology. It's also very convenient when it's a PyTorch built-in, so I can focus on writing kernels.
