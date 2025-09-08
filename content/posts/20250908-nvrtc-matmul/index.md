@@ -1,5 +1,5 @@
 +++
-date = '2025-09-06T15:25:20+08:00'
+date = '2025-09-08T08:44:00+08:00'
 title = 'Use NVRTC to explore MMA instruction variants'
 url = 'nvrtc-matmul'
 +++
