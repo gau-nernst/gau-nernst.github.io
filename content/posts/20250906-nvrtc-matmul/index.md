@@ -760,4 +760,17 @@ _TYPE_MAP = {
 
 The `itemsize` attribute is used to make shared memory size calculation work nicely, just like a `torch.dtype` object. These are the **only new changes** we need to make our code work with INT4 MMA! I could verify that the result is correct, even though INT4 MMA is probably running in emulation mode for 5090.
 
-To check the FLOPS of INT4 MMA, I rented a 4090 instance online.
+To check the FLOPS of INT4 MMA, I rented a 4090 instance online. I also took this chance to run benchmarks for other dtypes to see how they perform on an Ada GPU. Unit is TFLOPS.
+
+MMA type         | Mine | PyTorch
+-----------------|------|---------
+INT8             | 390  | 597
+INT4             | 756
+FP16 w/ FP32 acc | 161  | 156
+FP16 w/ FP16 acc | 272
+FP8 w/ FP32 acc  | 310  | 323
+FP8 w/ FP16 acc  | 512
+
+INT4 MMA is roughly 1.9x faster than INT8 MMA as expected, though you can see my INT8 kernel is quite bad in comparison with `torch._int_mm()` on 4090. Perhaps I need more autotuning (right now I just manually tweak the kernels params).
+
+FP8 and FP16 with FP16 accumulation also observe significant speedup compared to those with FP32 accumulation as expected, though I'm guessing they are power-limited here (or my kernel is just bad).
