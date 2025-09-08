@@ -225,7 +225,7 @@ void matmul_kernel(const TypeInput *A,
 }
 ```
 
-The header section in `kernel.cu` only exists to ensure syntax highlighting and autocompletion work during development with VSCode. When we compile the kernel, we can generate the header dynamically depending on the required parameters. You can see my full example here: https://github.com/gau-nernst/gn-kernels/tree/2263c25/gn-kernels/cuda_mm.
+The header section in `kernel.cu` only exists to ensure syntax highlighting and autocompletion work during development with VSCode. When we compile the kernel, we can generate the header dynamically depending on the required parameters. You can see my full example here: https://github.com/gau-nernst/gn-kernels/tree/c83ab83/gn_kernels/cuda_mm.
 
 ### Missing CUDA and C++ headers :(
 
@@ -691,7 +691,7 @@ dtype | FP32 accumulate | FP16 accumulate
 FP16  | 233 | 350
 FP8   | 465 | 692
 
-We didn't quite get 2x speedup since the GPU is probably power-limited. But we get quite close to the realistic Speed-of-Light of PRO 6000 that I previously documented here https://github.com/gau-nernst/gn-kernels/blob/2263c25f/README.md#realistic-sol.
+We didn't quite get 2x speedup since the GPU is probably power-limited. But we get quite close to the realistic Speed-of-Light of PRO 6000 that I previously documented here https://github.com/gau-nernst/gn-kernels/blob/c83ab83/README.md#realistic-sol.
 
 An interesting observation is that since we use 2x fewer registers for the accumulator, we can double either `BLOCK_M` or `BLOCK_N`, which I did when doing manual tuning of the kernel.
 
