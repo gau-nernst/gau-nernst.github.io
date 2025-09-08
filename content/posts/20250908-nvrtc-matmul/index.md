@@ -638,7 +638,7 @@ For benchmarking, I'm interested in two things.
 
 Not all MMA variants can be accessed via PyTorch. I only compare the most readily available ones:
 1. BF16 matmul via `torch.mm()`
-2. INT8 matmul via `torch.mm()`
+2. INT8 matmul via `torch._int_mm()`
 3. FP8 matmul via `torch._scaled_mm()` with tensor-wise scaling. This is not quite fair since it involves additional output scaling in the epilogue, but its runtime should be miniscule compared to the time spent in the MMA main loop.
 
 I obtained the following results for M=N=K=8192, with 5090 @ 600W. The unit is TFLOPS.
@@ -760,7 +760,7 @@ _TYPE_MAP = {
 
 The `itemsize` attribute is used to make shared memory size calculation work nicely, just like a `torch.dtype` object. These are the **only new changes** we need to make our code work with INT4 MMA! I could verify that the result is correct, even though INT4 MMA is probably running in emulation mode for 5090.
 
-To check the FLOPS of INT4 MMA, I rented a 4090 instance online. I also took this chance to run benchmarks for other dtypes to see how they perform on an Ada GPU. Unit is TFLOPS.
+To check the FLOPS of INT4 MMA, I rented a 4090 instance online. I also took this chance to run benchmarks for other dtypes to see how they perform on an Ada GPU. 4090 @ 450W, M=N=K=8192. Unit is TFLOPS.
 
 MMA type         | Mine | PyTorch
 -----------------|------|---------
