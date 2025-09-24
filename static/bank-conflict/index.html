@@ -39,10 +39,8 @@ function swizzle(m, n) {
   const rows_full_banks = Math.max(elems_full_banks / BLOCK_N, 1);
   const height_full_banks = elems_full_banks / group_width;
 
-  const group_n = Math.floor(n / group_width);
   const xor_pattern = Math.floor(m / rows_full_banks) % (height_full_banks / rows_full_banks);
-
-  const new_n = (group_n ^ xor_pattern) * group_width + (n % group_width);
+  const new_n = n ^ (xor_pattern * group_width);
   return [m, new_n];
 }
   </pre>
