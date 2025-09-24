@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Bank Conflict Visualizer</title>
+  <style>
+    body { font-family: sans-serif; padding: 1em; }
+    #grid { border: 1px solid #ccc; margin-top: 1em; }
+    textarea { width: 100%; height: 100px; }
+  </style>
+</head>
+<body>
+  <h1>Bank Conflict Visualizer</h1>
+
+  <h2>Hardware config</h2>
+  <label>Banks: <input id="banks" type="number" value="32"></label><br>
+  <label>Bank size (bytes): <input id="bank_size" type="number" value="4"></label><br>
+
+  <h2>Problem config</h2>
+  <label>BLOCK_M: <input id="BLOCK_M" type="number" value="16"></label><br>
+  <label>BLOCK_N: <input id="BLOCK_N" type="number" value="16"></label><br>
+  <label>Element size (bytes): <input id="elem_size" type="number" value="2"></label><br>
+  <label>Access group height: <input id="group_h" type="number" value="8"></label><br>
+  <label>Access group width: <input id="group_w" type="number" value="8"></label><br>
+  <p>For BF16/FP16, element size is 2 bytes.</p>
+
+  <h2>Visualization config</h2>
+  <label>Cell size: <input id="cell_size" type="number" value="48"></label>
+  <br><br>
+
+  <h2>Swizzle function</h2>
+  <p>
+    Maps logical indices to physical indices.<br>
+    You can access the following variables: <pre>num_banks, bank_size, elem_size, BLOCK_M, BLOCK_N</pre>
+    Here is an example of a more sophisticated swizzle function (you can copy-paste to the box below).
+  <pre>
+function swizzle(m, n) {
+  const elems_full_banks = (num_banks * bank_size) / elem_size;
+  const rows_full_banks = Math.max(elems_full_banks / BLOCK_N, 1);
+  const height_full_banks = elems_full_banks / group_width;
+
+  const group_n = Math.floor(n / group_width);
+  const xor_pattern = Math.floor(m / rows_full_banks) % (height_full_banks / rows_full_banks);
+
+  const new_n = (group_n ^ xor_pattern) * group_width + (n % group_width);
+  return [m, new_n];
+}
+  </pre>
+  </p>
+  <textarea id="swizzle">function swizzle(m, n) {
+  return [m, n];
+}</textarea>
+  <br>
+  <button onclick="draw()">Draw</button><br>
+
+  <ul>
+  <li>The grid below shows <b>physical layout</b>.</li>
+  <li>Cell color denotes bank ID.</li>
+  <li>The number pair in each cell denote <b>logical indices</b> (m,n).</li>
+  <li>When you hover over the grid, it shows the group of elements that will be accessed at the same time (access group height and width).</li>
+  <li>Bank conflicts occur when there is any bank ID that needs to service more than bank size (i.e. 4 bytes, assuming natural alignment).</li>
+  </ul>
+
+  <canvas id="grid"></canvas>
+
+  <script>
+    const canvas = document.getElementById('grid');
+    let hoverCell = null;
+
+    // handle high-DPI
+    function resizeCanvas(canvas, width, height) {
+      const dpr = window.devicePixelRatio || 1;
+
+      // internal resolution
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+
+      // CSS size
+      canvas.style.width = width + "px";
+      canvas.style.height = height + "px";
+
+      // scale everything
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return ctx;
+    }
+
+    function draw() {
+      const num_banks = parseInt(document.getElementById('banks').value);
+      const bank_size = parseInt(document.getElementById('bank_size').value);
+
+      const BLOCK_M = parseInt(document.getElementById('BLOCK_M').value);
+      const BLOCK_N = parseInt(document.getElementById('BLOCK_N').value);
+      const elem_size = parseInt(document.getElementById('elem_size').value);
+      const group_height = parseInt(document.getElementById('group_h').value);
+      const group_width = parseInt(document.getElementById('group_w').value);
+
+      // resize canvas to preserve aspect ratio
+      const cellSize = parseInt(document.getElementById('cell_size').value);
+      const ctx = resizeCanvas(canvas, BLOCK_N * cellSize, BLOCK_M * cellSize);
+
+      // compile user swizzle function
+      try { eval(document.getElementById('swizzle').value); }
+      catch (e) { alert("Error in swizzle function: " + e); return; }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.font = `${Math.floor(cellSize / 4)}px sans-serif`;
+
+      // color grid based on banks
+      for (let m = 0; m < BLOCK_M; m++)
+        for (let n = 0; n < BLOCK_N; n++) {
+          const addr = (m * BLOCK_N + n) * elem_size;
+          const bank_id = Math.floor(addr / bank_size) % num_banks;
+
+          ctx.fillStyle = `hsl(${bank_id * 360 / num_banks}, 70%, 60%)`;
+          ctx.fillRect(n * cellSize, m * cellSize, cellSize - 1, cellSize - 1);
+        }
+
+      // highlight logic
+      if (hoverCell) {
+        // inverse swizzle function
+        // flatten the loop so that we can break out of it
+        let logical_m, logical_n;
+        for (let idx = 0; idx < BLOCK_M * BLOCK_N; idx++) {
+          const m = Math.floor(idx / BLOCK_N);
+          const n = idx % BLOCK_N;
+          let [physical_m, physical_n] = swizzle(m, n);
+          if (physical_m == hoverCell.m && physical_n == hoverCell.n) {
+            logical_m = m;
+            logical_n = n;
+            break;
+          }
+        }
+
+        // NOTE: may have problems if swizzle is not valid i.e. not one-to-one
+        const group_id_m = Math.floor(logical_m / group_height);
+        const group_id_n = Math.floor(logical_n / group_width);
+
+        for (let off_m = 0; off_m < group_height; off_m++) {
+          const m = group_id_m * group_height + off_m;
+          const n = group_id_n * group_width;
+          let [physical_m, physical_n] = swizzle(m, n);
+
+          ctx.strokeStyle = "#8B0000";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(physical_n * cellSize, physical_m * cellSize, cellSize * group_width - 1, cellSize - 1);
+          ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
+          ctx.fillRect(physical_n * cellSize, physical_m * cellSize, cellSize * group_width - 1, cellSize - 1);
+        }
+      }
+
+      // annotate logical indices
+      // draw text last to ensure visibility
+      for (let m = 0; m < BLOCK_M; m++)
+        for (let n = 0; n < BLOCK_N; n++) {
+          let [physical_m, physical_n] = swizzle(m, n);
+
+          ctx.fillStyle = "black";
+          ctx.fillText([m,n], (physical_n + 0.5) * cellSize, (physical_m + 0.5) * cellSize);
+      }
+    }
+
+    // handle mouse move to detect hover
+    canvas.addEventListener("mousemove", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const cellSize = parseInt(document.getElementById('cell_size').value);
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const n = Math.floor(x / cellSize);
+      const m = Math.floor(y / cellSize);
+
+      // early exit
+      if (hoverCell && hoverCell.m === m && hoverCell.n === n) return;
+
+      // redraw
+      hoverCell = {m, n};
+      draw();
+    });
+
+    // reset hover when mouse leaves canvas
+    canvas.addEventListener("mouseleave", () => {
+      hoverCell = null;
+      draw();
+    });
+
+    draw(); // initial draw
+  </script>
+</body>
+</html>
