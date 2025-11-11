@@ -612,3 +612,4 @@ Lastly, I would like to thank the following people, without whom this blog post 
 - The competition organizers, AMD and GPU MODE, for giving me the opportunity to learn about multi-GPU programming.
 - [zhubenzhu](https://github.com/benenzhu), my accidental teammate, with whom I exchanged numerous cool ideas and knowledge. Per-token flag design and the intra-kernel profiling trick were from him.
 - [Iris](https://github.com/ROCm/iris)'s authors for creating such an elegant library. Their [GPU MODE lecture](https://www.youtube.com/watch?v=H2bzSn5ZPks) was my first introduction to multi-GPU programming. Even though I didn't use Iris directly, it was instrumental to my understanding of symmetric memory and various tricks for AMD GPUs.
+- [Yotta Labs](https://www.yottalabs.ai/) for sponsoring the compute for our kernel development.
