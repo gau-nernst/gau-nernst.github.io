@@ -1,0 +1,6 @@
+/* Custom CSS overrides */
+
+/* Increase content width from 680px to 800px */
+:root {
+  --w: calc(800px + 32px * 2);
+}
