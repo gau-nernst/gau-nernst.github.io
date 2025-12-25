@@ -41,7 +41,7 @@ def tiled_matmul(A: Tensor, B: Tensor, C: Tensor, M: int, N: int, K: int):
     for m in range(0, M, BLOCK_M):
         for n in range(0, N, BLOCK_N):
             # initialize accumulator
-            acc = torch.zeros(M, N)
+            acc = torch.zeros(BLOCK_M, BLOCK_N)
 
             # doing mini matmuls along K
             for k in range(0, K, BLOCK_K):
