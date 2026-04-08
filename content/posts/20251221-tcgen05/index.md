@@ -705,10 +705,11 @@ Concept | Key points
 
 I roughly know that we should use 128-byte swizzling, the largest supported swizzling size by the TMA, so let's look into it next. I won't cover swizzling extensively here, you should refer to other articles for a more detailed explanation.
 
-Swizzling is a technique to avoid shared memory bank conflicts by distributing the data (being loaded by a particular access pattern) across all 32 memory banks. I built a [Bank Conflict Visualizer](/bank-conflict/) to illustrate this before. By default, it's showing the access pattern of `ldmatrix` (`8x16B`) for a BF16 case, which suffers from bank conflicts. Swizzling typically involves XOR-ing the column indices with their row indices so that elements within the same row are *permuted* differently across rows.
+Swizzling is a technique to avoid shared memory bank conflicts by distributing the data (being loaded by a particular access pattern) across all 32 memory banks. I built a [Bank Conflict Visualizer](/bank-conflict/) to illustrate this before. By default, it's showing the access pattern of `ldmatrix` (`8x16B`) for a BF16 case, which suffers from bank conflicts. Swizzling typically involves XOR-ing the column indices with their row indices so that elements within the same row are *permuted* differently across columns.
 
-Swizzling in TMA is in the granularity of 16 bytes. Different swizzling patterns specify the size of data to be swizzled. For example, `CU_TENSOR_MAP_SWIZZLE_128B` means in a chunk of 128 bytes, we have eight 16-byte units. These eight units are permuted according to its row index. This can be visualized like below.
-- Technically the visualization is not quite correct as there is a constraint on the row size for each swizzling type.
+**Update 08/04/2026**: This section was updated to correctly describe TMA swizzling.
+
+Swizzling in TMA is in the granularity of 16 bytes. Different swizzling patterns specify the size of data to be swizzled (not quite, more on this later). For example, `CU_TENSOR_MAP_SWIZZLE_128B` means in a chunk of 128 bytes, we have eight 16-byte units. These eight units are permuted according to its row index. This can be visualized like below.
 
 {{< figure src="tma_swizzle.webp" alt="Swizzling patterns in TMA" caption="Some swizzling patterns supported by TMA." align="center">}}
 
@@ -719,6 +720,12 @@ To reproduce the swizzling patterns above with my interactive visualizer, you ca
 - Access group width to 1
 
 and use the swizzle function as shown in the picture.
+
+The diagram above is accurate in how the data is redistributed, but it doesn't quite align with the logical layout encoded in TMA descriptor. [CUDA doc](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#table-swizzle-pattern-properties-and-requirements) mentions that for 32B/64B/128B swizzling, the shared box's innermost dimension must be **at most 32B/64B/128B** respectively (in practice, it should be *exactly 32B/64B/128B*). But the "row index" used for swizzling only increments after every 128B (covering all of 32 memory banks) regardless of swizzling modes. If we draw the physical 2D tile of shared memory, it would look like this.
+
+{{< figure src="tma_swizzle_smem.webp" alt="Swizzling patterns in shared memory" caption="Shared memory physical layout with various swizzling modes." align="center">}}
+
+Note: To verify the swizzling pattern used by TMA, you can issue a TMA load with swizzling enabled, and TMA store without swizzling, then inspect the returned results. The code was a bit verbose so I don't include it here, but it should be straight-forward.
 
 Before modifying the code, we need to understand how `tcgen05.mma` understands swizzled shared memory. [Bit 61-63](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-shared-memory-descriptor) of the shared memory descriptor specify the swizzling mode, but we are still not sure how the shared memory layout should look like. Backtracking to the [Canonical layouts section](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-canonical-layouts), we see this table.
 
