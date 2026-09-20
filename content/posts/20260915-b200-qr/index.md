@@ -347,17 +347,15 @@ Matrix inversion has always been the annoyingly slow operator. From my prior kno
 
 However, what we can exploit is the **triangular structure** of the matrix that we are taking the inverse of. For unknown reasons, there are no standard triangular matrix inverse functions (technically there is [`cusolverDnXtrtri`](https://docs.nvidia.com/cuda/cusolver/index.html#cusolverdnxtrtri) but it only supports a single matrix, no batch API), only **triangular solve** i.e. compute $Y = X^{-1} A$. We can do triangular solve against an identity matrix for example, but again it won't be optimal.
 
-The approach to triangular matrix inverse is pretty simple: we partition the matrix into 2x2 smaller tiles, and compute the inverse on 3 of them using [forward substitution](https://en.wikipedia.org/wiki/Triangular_matrix#Forward_substitution) (1 tile is fully empty because of the triangular structure). The diagonal tiles' inverse is final, but off-diagonal tile requires an additional pass using block forward substitution (the same as foward substitution formula, but replace scalar multiplication with matrix multiplication).
+The approach to triangular matrix inverse is pretty simple: we partition the matrix into 2x2 smaller tiles, and compute the inverse on the 2 diagonal tiles, which are themselves triangular, using [forward substitution](https://en.wikipedia.org/wiki/Triangular_matrix#Forward_substitution). The results for off-diagonal are final. For off-diagonal, we only need to compute one of them, since the other one is zeros, using block forward substitution (the same as foward substitution formula, but replace scalar multiplication with matrix multiplication).
 
-TODO: diagram
+{{< figure src="triangular_inverse.svg" alt="Triangular inverse" caption="Triangular matrix inversion. Forward substitution for diagonal tiles, and block forward substitution for off-diagonal tile." >}}
 
 It was some time ago so I couldn't remember all the details but in the end I only provided 96x96 and 128x128 inverse. One possible reason is that they provide the largest possible panel size under my panel QR design (352x128x4 = 180,224 and 512x96x4 = 196,608 < 228 kB smem limit), and they factor into nice powers of 2 (96 = 64 + 32).
 
-I found that doing repeated, hierarchical 2x2 block forward substitution is faster than 3x3 or 4x4 block forward substitution, even though the latter require less FLOPs. I think it's because 2x2 block requires significantly less memory synchronization, though it can also be skill issue in my part.
+I found that doing repeated, hierarchical 2x2 block forward substitution is faster than 3x3 or 4x4 block forward substitution, even though the latter require less FLOPs. I think it's because 2x2 block requires significantly less memory synchronization, though it can also be a skill issue in my part. For the largest off-diagonal inverse, 64x64 off-diagonal tile in 128x128 inverse and 32x64 in 96x96 inverse, I use PyTorch for the matmuls since I don't think I can write a better one myself.
 
-TODO: diagram
-
-For the largest off-diagonal inverse, 64x64 off-diagonal tile in 128x128 inverse and 64x32 in 96x96 inverse, I use PyTorch for the matmul since I don't think I can write a better one myself.
+{{< figure src="inverse_96_128.svg" alt="Inverse 96 and 128" caption="Build up 96x96 and 128x128 triangular inverse from 16x16, 32x32, and 64x64 inverses." >}}
 
 ## QR1024: 2-CTA, threadblock cluster communication
 
@@ -450,6 +448,8 @@ for (int i = 0; i < 8; i++) {
 The reflector itself is already stored in shared memory for consumer warps within the same CTA, hence we only need to issue the shared-to-shared TMA. For tau, we use `st.async`, which should be faster than normal store (I didn't measure but I hope it's faster in the sense that it's non-blocking so the producer warp can continue its execution).
 
 To get CTA1's shared memory address, we simply set a particular bit, instead of [clearing it](https://github.com/NVIDIA/cutlass/blob/v4.7.1/include/cute/arch/copy_sm100_tma.hpp#L63) as in the original tcgen05 tutorial.
+
+TODO: 1-SM and 2-SM kernel
 
 ## QR2048 and QR4096: Multi-CTA, grid-wide coordination
 
