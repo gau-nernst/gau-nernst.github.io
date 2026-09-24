@@ -347,8 +347,9 @@ Another thing to note that an optimal schedule depends on the performance of the
 
 With the compact WY transform framework in place, we need to make it run faster. The most obvious area to attack is **low precision matmul**: there are 4 GEMMs involved per compact WY transform, and B200 has very bad FP32 TFLOPS compared to FP16/BF16 (70 FP32 TFLOPS vs ~1000 TF32 TFLOPS vs ~2000 FP16/BF16 TFLOPS). Using TF32 was easy, it was a PyTorch flag away, though that was a bit annoying to do fine-grained precision policy for each matmul (they have different sensitivity to the final results, especially tricky for QR512 test cases!).
 
-TODO:
-- FP16 matmul with FP32 output
+I only experimented up to FP16, which was already not accurate enough in many cases. I can't remember if I tried BF16, but I think BF16 should be less accurate than FP16 since we have more mantissa bits with FP16. One important detail is that I use **FP16 matmul with FP32 output** to maintain precision for later operations e.g. matrix inversion after `V^T @ V`. This can be done directly in PyTorch with `torch.baddbmm(out_dtype=torch.float32)`.
+
+Ideally we also want dtype casting to be fused with prior ops to avoid standalone conversion kernels. Hence, QR panel kernels now also output FP16 reflectors, in addition to FP32 reflectors. Why do we need both precisions? As it turns out, final QR decomposition results are very sensitive to the precision of each matmul happening in compact WY transform. Hence, some matmuls like `gram = V^T @ V` and `V^T @ trailing` have to be kept in TF32, possibly because the reduction dim, which is equal to panel size, is small.
 
 ### Triangular matrix inversion
 
@@ -374,31 +375,9 @@ For QR1024, we are under-utilizing the GPUs since B200 has 148 SMs but the probl
 
 They both conveniently report the completion via mbarrier. We can naturally extend our current design to 2-CTA with threadblock cluster. CTA0 additionally sends its reflectors to CTA1, while CTA1 now has an extra stage of receiving CTA0's reflectors, instead of just its own.
 
-TODO: diagram here
+{{< figure src="qr_2sm.svg" alt="2-SM QR panel kernel" caption="2-SM QR panel kernel. Each half performs exactly the same as before. Additionally, CTA0 sends its reflectors to CTA1 during its half." >}}
 
 ```cpp
-extern __shared__ float storage[];
-float* reflectors = storage;
-constexpr int LOCAL_COLS = COLS / 2;
-float* taus = reflectors + ROWS * LOCAL_COLS;
-const int reflector_addr = __cvta_generic_to_shared(reflectors);
-const int tau_addr = reflector_addr + ROWS * LOCAL_COLS * 4;
-const int mbars = tau_addr + COLS * 4;
-
-// (NEW) precompute CTA1's smem address
-// CTA1 doesn't need this, so we compute it unconditionally.
-const int reflector_addr1 = reflector_addr | 0x01000000;
-const int tau_addr1 = tau_addr | 0x01000000;
-
-// replace __syncthreads() with cluster barrier to make sure
-// one CTA not race before peer CTA init its mbarriers.
-if (warp == 0 && elect_sync()) {
-  for (int i = 0; i < COLS; ++i) mbar_init(mbars + i * 8, 1);
-  asm volatile("fence.mbarrier_init.release.cluster;");
-}
-asm volatile("barrier.cluster.arrive.relaxed.aligned;");
-asm volatile("barrier.cluster.wait.acquire.aligned;");
-
 // (NEW) consumer: update using reflectors from CTA0
 // this is a 0-iter loop on CTA0
 for (int panel = 0; panel < rank * NUM_WARPS; panel++) {
@@ -439,7 +418,7 @@ for (int i = 0; i < 8; i++) {
     // signal to other warps in current CTA
     mbar_arrive(mbars + col * 8);
 
-    // (NEW) signal to peer CTA
+    // (NEW) CTA0 only: signal to CTA1
     if (rank == 0) {
       // magic number to get peer CTA's smem address
       // send reflector with TMA, send tau with st.async
@@ -456,7 +435,9 @@ for (int i = 0; i < 8; i++) {
 }
 ```
 
-The reflector itself is already stored in shared memory for consumer warps within the same CTA, hence we only need to issue the shared-to-shared TMA. For tau, we use `st.async`, which should be faster than normal store (I didn't measure but I hope it's faster in the sense that it's non-blocking so the producer warp can continue its execution). To get CTA1's shared memory address, we simply set a particular bit, instead of [clearing it](https://github.com/NVIDIA/cutlass/blob/v4.7.1/include/cute/arch/copy_sm100_tma.hpp#L63) as in the original tcgen05 tutorial.
+The reflector itself is already stored in shared memory for consumer warps within the same CTA, hence we only need to issue an additional shared-to-shared TMA. For tau, we use `st.async`, which should be faster than normal store (I didn't measure but I hope it's faster in the sense that it's non-blocking so the producer warp can continue its execution). To get CTA1's shared memory address, we simply set a particular bit, instead of [clearing it](https://github.com/NVIDIA/cutlass/blob/v4.7.1/include/cute/arch/copy_sm100_tma.hpp#L63) as in the original tcgen05 tutorial.
+
+Overall, it's a simple extension from our previous 1-SM kernel. We have more consumers, and they reside in another SM, hence we need to send data and signal to them. Another added benefit from 2-SM kernel is that **we can double the panel width** since each CTA only needs to hold half number of reflectors. Comparing between 1-SM and 2-SM kernels for SM-limited shapes:
 
 TODO: 1-SM and 2-SM kernel perf comparison
 
