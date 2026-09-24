@@ -91,7 +91,7 @@ For larger problem shapes, 1 warp definitely can't hold the entire matrix in reg
 
 As mentioned earlier, 256-bit load is something we definitely want to do. Thus, each warp holds $[N, 8]$ tile of the problem shape, where each lane holds $[\mathrm{ceil}(N/32), 8]$ elements. There will be some rounding effect as N might not divide by 32 (e.g. 176 % 32 = 16). It's a bit annoying to handle but not too bad. The whole problem shape is now partitioned into $[N, 8]$ work tiles.
 
-{{< figure src="panel8.svg" alt="Thread layout" caption="Thread layout: each warp holds $[N,8]$ tile, where each lane loads 8 consecutive FP32 values." >}}
+{{< figure src="panel8.svg" width=500 alt="Single-CTA Thread layout" caption="Thread layout in Single-CTA kernel design: each warp holds $[N,8]$ tile, where each lane loads 8 consecutive FP32 values." >}}
 
 Let's see if we have enough registers to hold the full 176x176 matrix in one CTA's register memory. 176x176 = 30,976. But recall that we need to round up the column size to the next multiple of 32, hence the number of registers is actually 192x176 = 33,792. This is well below the 64k register limit per CTA. Morever, since batch size is 40 for QR176, occupancy is not a concern i.e. we can use 1 SM per matrix and fully utilize an SM's resources for the CTA. Hence, for QR176, we use 176/8 = 22 warps per CTA, where each warp owns a $[N, 8]$ tile.
 
@@ -335,11 +335,20 @@ For the larger QR1024 shape, we have to replace 256-bit global loads (8 FP32 ele
 
 ### Panel schedule
 
+With the knowledge of compact WY transform, we can decide to split a matrix into panels in different ways. For example, 512 can be decomposed into 128+128+128+128 or 64+64+128+128+128. I call a particular decomposition a **Panel schedule** (not sure if it's a proper term, it's just how I call it). The next question is to determine an optimal schedule.
 
+If we want to be scientific, I suppose we can build a **Cost model** to predict e2e runtime given a schedule, then optimize the schedule for a particular QR shape (we can either have a performance model for our LEGO kernel pieces - panel QR, compact WY transform, or sample a few data points and fit a curve). However, agents have been excellent at doing autotuning, hence there were no reasons to do anything more sophisticated for the fixed problem shapes. Perhaps for a general QR solution, where we don't know the exact shape ahead of time, a cost model that aids schedule optimization would be useful.
+
+Another thing to note that an optimal schedule depends on the performance of the constituent kernels: panel QR, tiny GEMMs and matrix inversion in compact WY transform. Our later optimizations in these components require a re-tuning of the panel schedule, hence I only did the exhaustive tuning (i.e. throw it to an agent) near the end of the competition. Regardless, there are some useful heuristics or constraints that help narrow the search space, such as shared memory constraint, and efficient matrix inversion shapes.
+
+{{< figure src="qr512_schedule.svg" width=400 alt="QR512 Panel schedule" caption="Final Panel schedule chosen for QR512: 96+96+128+192. The QR panels are 512x96, 416x96, 320x128, and 192x192." >}}
 
 ### Low precision matmul
 
 With the compact WY transform framework in place, we need to make it run faster. The most obvious area to attack is **low precision matmul**: there are 4 GEMMs involved per compact WY transform, and B200 has very bad FP32 TFLOPS compared to FP16/BF16 (70 FP32 TFLOPS vs ~1000 TF32 TFLOPS vs ~2000 FP16/BF16 TFLOPS). Using TF32 was easy, it was a PyTorch flag away, though that was a bit annoying to do fine-grained precision policy for each matmul (they have different sensitivity to the final results, especially tricky for QR512 test cases!).
+
+TODO:
+- FP16 matmul with FP32 output
 
 ### Triangular matrix inversion
 
@@ -359,11 +368,13 @@ I found that doing repeated, hierarchical 2x2 block forward substitution is fast
 
 ## QR1024: 2-CTA, threadblock cluster communication
 
-For QR1024, we are still under-utilizing the GPUs since B200 has 148 SMs but the problem shape only has batch=60. A natural idea is to use more than 1 CTA to process the panel QR, but that would introduce potentially expensive cross-CTA communication. Luckily, I recall there are nifty tools available to threadblock cluster:
+For QR1024, we are under-utilizing the GPUs since B200 has 148 SMs but the problem shape only has batch=60. A natural idea is to use more than 1 CTA to process the panel QR, but that would introduce potentially expensive cross-CTA communication. Luckily, I recall there are nifty tools available to threadblock cluster:
 - [`st.async`](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st-async): non-blocking store operation from register to shared memory of a peer CTA.
 - [S2S TMA](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk): TMA from local shared memory to peer CTA's shared memory.
 
-They both report the completion via mbarrier, which is convenient. We can naturally extend our current design to 2-CTA with threadblock cluster. CTA0 additionally sends its reflectors to CTA1, while CTA1 now has an extra stage of receiving CTA0's reflectors, instead of just its own.
+They both conveniently report the completion via mbarrier. We can naturally extend our current design to 2-CTA with threadblock cluster. CTA0 additionally sends its reflectors to CTA1, while CTA1 now has an extra stage of receiving CTA0's reflectors, instead of just its own.
+
+TODO: diagram here
 
 ```cpp
 extern __shared__ float storage[];
@@ -445,17 +456,15 @@ for (int i = 0; i < 8; i++) {
 }
 ```
 
-The reflector itself is already stored in shared memory for consumer warps within the same CTA, hence we only need to issue the shared-to-shared TMA. For tau, we use `st.async`, which should be faster than normal store (I didn't measure but I hope it's faster in the sense that it's non-blocking so the producer warp can continue its execution).
+The reflector itself is already stored in shared memory for consumer warps within the same CTA, hence we only need to issue the shared-to-shared TMA. For tau, we use `st.async`, which should be faster than normal store (I didn't measure but I hope it's faster in the sense that it's non-blocking so the producer warp can continue its execution). To get CTA1's shared memory address, we simply set a particular bit, instead of [clearing it](https://github.com/NVIDIA/cutlass/blob/v4.7.1/include/cute/arch/copy_sm100_tma.hpp#L63) as in the original tcgen05 tutorial.
 
-To get CTA1's shared memory address, we simply set a particular bit, instead of [clearing it](https://github.com/NVIDIA/cutlass/blob/v4.7.1/include/cute/arch/copy_sm100_tma.hpp#L63) as in the original tcgen05 tutorial.
-
-TODO: 1-SM and 2-SM kernel
+TODO: 1-SM and 2-SM kernel perf comparison
 
 ## QR2048 and QR4096: Multi-CTA, grid-wide coordination
 
 For QR2048 and QR4096, there are only 8 and 2 matrices respectively per kernel invocation, prompting us to use even more CTAs per QR matrix. Threadblock cluster supports more than 2-CTAs, but they are not scalable: The data transfer (`st.async` and S2S TMA) is push-based, meaning that we would need to push to every consuming CTAs, resulting in extra memory traffic. Doing pull-based data transfer would not improve the situation: not only we still have to do signalling (i.e. the consumer CTAs need to know when data is ready), memory traffic is neither reduced.
 
-Instead of using threadblock cluster, we can go back to the more traditional inter-CTA synchronization via global memory (or L2 to be exact). Producer CTAs publish reflectors to global memory, and consumer CTAs can read from global memory to update their owned columns. Synchronization is achieved with GPU-scope release-acquire semantics.
+Instead of using threadblock cluster, we can go back to the more traditional inter-CTA synchronization via global memory (or L2 to be exact). Producer CTAs publish reflectors to global memory, and consumer CTAs can read from global memory to update their owned columns. Synchronization is achieved with **GPU-scope release-acquire semantics**.
 
 Another issue with large QR matrix shapes is that 1 warp can't hold the full `[rows, 8]` panel in register memory (2048 x 8 / 32 = 512 registers/thread). Hence, we have no choice but to distribute a single column across multiple warps. This means that many subroutines that require a column reduction, such as computing the reflectors and doing column updates, necessiate cross-warp reduction via shared memory.
 
