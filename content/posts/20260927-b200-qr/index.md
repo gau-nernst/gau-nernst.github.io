@@ -1,5 +1,5 @@
 +++
-date = '2026-09-27T20:00:00+08:00'
+date = '2026-09-27T19:20:00+08:00'
 title = "World's fastest (panel) QR factorization on B200"
 url = 'b200-qr'
 +++
