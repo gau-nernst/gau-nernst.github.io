@@ -14,7 +14,7 @@ As usual, my submission is open-sourced at [gau-nernst/gpu-mode-kernels](https:/
 I don't want to touch too much on this as I'm no expert on the topic (in fact, I only learned about QR decomposition, mostly from Codex, during the competition). There are excellent resources online explaining this, such as [the one from Michael](https://ml-mike.com/writing/qr_v2/). Instead, I will focus on my thought process tackling the crux of the challenge: chained dependency.
 
 ```python
-# input: A[M, N]
+# input: A[N, N]
 
 # we can't parallelize the outer loop
 for n in range(N-1):
@@ -22,12 +22,12 @@ for n in range(N-1):
 
     # we can parallelize the inner loop
     for tail in range(n+1, N):
-        A[n:, tail] = reflect(A[N:, tail], reflector)
+        A[n:, tail] = reflect(A[n:, tail], reflector)
 ```
 
-As you can see from the rough outline of the QR algorithm above, computing the Householder for column n requires the reflectors from all previous columns, making it impossible to parallelize the Householder computation. However, the trailing columns update can be parallelized easily as they are independent. One simple strategy is to let 1 warp computes the Householder (computing Householder requires a reduction of that column, hence we want to use a single warp to avoid cross-warp communication), then multiple warps can update the trailing columns at the same time. This is the crux of my approach to (panel) QR decomposition.
+As you can see from the rough outline of the QR algorithm above, computing the Householder for column n requires the reflectors from all previous columns, making it impossible to parallelize the Householder computation. However, the trailing columns update can be parallelized easily as they are independent. One simple strategy is to let 1 warp compute the Householder (computing Householder requires a reduction of that column, hence we want to use a single warp to avoid cross-warp communication), then multiple warps can update the trailing columns at the same time. This is the crux of my approach to (panel) QR decomposition.
 
-In terms of the problem shapes, there are 7 unique shapes, with some shapes are generated in certain special ways.
+In terms of the problem shapes, there are 7 unique shapes, but some shapes have specially generated cases.
 
 ID | Batch | n | Case
 ---|---|---|---
@@ -79,7 +79,7 @@ for (int i = 0; i < 32 / 8; i++)
 ```
 
 I want to highlight certain design decisions here:
-- We definitely want to use vectorized 256-bit loads on Blackwell. This limits what thread layout (i.e. which elements of a matrix a thread holds) we can use. Since the input data is in row-major, a thread needs to hold a row tile spanning over multiple columns. For a 32x32 matrix and a single warp design we are currently exploring, letting each thread holds an entire row is a natural choice.
+- We definitely want to use vectorized 256-bit loads on Blackwell. This limits what thread layout (i.e. which elements of a matrix a thread holds) we can use. Since the input data is in row-major, a thread needs to hold a row tile spanning over multiple columns. For a 32x32 matrix and a single warp design we are currently exploring, letting each thread hold an entire row is a natural choice.
 - It's important to have `#pragma unroll` directives. Normally I don't find it very useful since nvcc is already quite aggressive at loop unrolling. However, perhaps because the loop count is quite large, nvcc decided not to unroll it.
 - Once the loops are fully unrolled, loop iterators are "constants". Hence, using `col` or `trail` to index register array `x[]` will not cause register spilling to local memory (for dynamic indexing) as the register can be addressed directly.
 
@@ -89,11 +89,11 @@ I didn't keep this implementation in the end because it was not faster than my n
 
 For larger problem shapes, 1 warp definitely can't hold the entire matrix in register memory. Hence, we need to design a multi-warp strategy.
 
-As mentioned earlier, 256-bit load is something we definitely want to do. Thus, each warp holds $[N, 8]$ tile of the problem shape, where each lane holds $[\mathrm{ceil}(N/32), 8]$ elements. There will be some rounding effect as N might not divide by 32 (e.g. 176 % 32 = 16). It's a bit annoying to handle but not too bad. The whole problem shape is now partitioned into $[N, 8]$ work tiles.
+As mentioned earlier, we definitely want 256-bit loads. Thus, each warp holds a $[N, 8]$ tile of the problem shape, where each lane holds $[\mathrm{ceil}(N/32), 8]$ elements. There will be some rounding effect as N might not be divisible by 32 (e.g. 176 % 32 = 16). It's a bit annoying to handle but not too bad. The whole problem shape is now partitioned into $[N, 8]$ work tiles.
 
-{{< figure src="panel8.svg" width=500 alt="Single-CTA Thread layout" caption="Thread layout in Single-CTA kernel design: each warp holds $[N,8]$ tile, where each lane loads 8 consecutive FP32 values." >}}
+{{< figure src="panel8.svg" width=500 alt="Single-CTA Thread layout" caption="Thread layout in Single-CTA kernel design: each warp holds a $[N,8]$ tile, where each lane loads 8 consecutive FP32 values." >}}
 
-Let's see if we have enough registers to hold the full 176x176 matrix in one CTA's register memory. 176x176 = 30,976. But recall that we need to round up the column size to the next multiple of 32, hence the number of registers is actually 192x176 = 33,792. This is well below the 64k register limit per CTA. Morever, since batch size is 40 for QR176, occupancy is not a concern i.e. we can use 1 SM per matrix and fully utilize an SM's resources for the CTA. Hence, for QR176, we use 176/8 = 22 warps per CTA, where each warp owns a $[N, 8]$ tile.
+Let's see if we have enough registers to hold the full 176x176 matrix in one CTA's register memory. 176x176 = 30,976. But recall that we need to round up the column size to the next multiple of 32, hence the number of registers is actually 192x176 = 33,792. This is well below the 64k register limit per CTA. Moreover, since batch size is 40 for QR176, occupancy is not a concern i.e. we can use 1 SM per matrix and fully utilize an SM's resources for the CTA. Hence, for QR176, we use 176/8 = 22 warps per CTA, where each warp owns a $[N, 8]$ tile.
 
 Up to this point, we still haven't used any shared memory for storing the full matrix at all. This is a deliberate choice: even though shared memory is fast compared to global memory, it still can't beat holding the data in register memory, which eliminates data roundtrip to shared memory, as long as resource limit allows.
 
@@ -140,7 +140,7 @@ float x[ROW_ITEMS][8];
 ...
 
 // NEW: update columns with previous reflectors
-for (int col = 0; col = warp_id * 8; col++) {
+for (int col = 0; col < warp_id * 8; col++) {
   ...
 }
 
@@ -151,11 +151,11 @@ for (int i = 0; i < 8; i++) {
 }
 ```
 
-The above design also establishes an interesting producer-consumer pattern: every warp takes turn to become a producer (computes and publishes reflectors), while the remaining ones are consumers (updates their owned columns). Once a warp has finished its job (i.e. update the columns and compute the reflectors), it can exit early.
+The above design also establishes an interesting producer-consumer pattern: every warp takes turns to be a producer (computes and publishes reflectors), while the remaining ones are consumers (updates their owned columns). Once a warp has finished its job (i.e. update the columns and compute the reflectors), it can exit early.
 
-{{< figure src="producer_consumer.svg" alt="Producer-Consumer pattern" caption="Producer-Consumer pattern: each warp takes turn to be the producer." >}}
+{{< figure src="producer_consumer.svg" alt="Producer-Consumer pattern" caption="Producer-Consumer pattern: each warp takes turns to be the producer." >}}
 
-A natural choice for cross-warp communication is via shared memory. Recall that for QR176, we need 176x176x4 = 123,904 bytes (with padding) to hold the whole matrix. This is the same size for holding all of the reflectors (we purposely don't do compact storage to avoid inefficient memory access and complicated, non-uniform logic that may affect codegen), and it's far below Blackwell's shared memory limit of ~227kb. Again, occupancy is not a concern (batch size < number of SMs), so we are free to use all of the available shared memory.
+A natural choice for cross-warp communication is via shared memory. Recall that for QR176, we need 176x176x4 = 123,904 bytes (with padding) to hold the whole matrix. This is also the storage size to hold all of the reflectors (we purposely don't do compact storage to avoid inefficient memory access and complicated, non-uniform logic that may affect codegen), and it's far below Blackwell's shared memory limit of ~227kb. Again, occupancy is not a concern (batch size < number of SMs), so we are free to use all of the available shared memory.
 
 Fitting all of the reflectors in shared memory means that we don't need shared buffer reuse logic. Imagine if we can only hold 16 reflectors in shared memory. For the 17th reflector, its producer must wait for all consumers of the 1st reflector to finish before it can override the buffer slot, adding extra synchronization latency. But if we can hold all of the reflectors at once, producer warps literally "fire and forget: they can publish their reflectors without any delay, signal, then continue their work (self-update the columns and compute next reflectors).
 
@@ -173,7 +173,7 @@ float* taus = reflectors + ROWS * COLS;  // [COLS]
 
 // consumer phase: update columns with previous reflectors
 // panel is dynamic loop, i is fully unrolled
-for (int panel = 0; panel = warp_id; panel++) {
+for (int panel = 0; panel < warp_id; panel++) {
   for (int i = 0; i < 8; i++) {
     const int col = panel * 8 + i;
     __syncthreads();  // wait for reflectors to arrive
@@ -215,7 +215,7 @@ for (int i = 0; i < 8; i++) {
 
 Notice we are using `__syncthreads()` for memory synchronization here. You may find it strange that warps don't arrive on the same `__syncthreads()` line of code e.g. when warp1 waits for warp0's reflectors, warp1 enters `__syncthreads()` of the consumer block, while warp0 uses `__syncthreads()` in the producer block. This is perfectly fine and correct. `__syncthreads()` compiles to [`bar.sync 0` in PTX](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar), or sometimes known as [`NamedBarrier` in CUTLASS](https://github.com/NVIDIA/cutlass/blob/v4.7.1/include/cutlass/arch/barrier.h#L287), which is one of the 16 hardware barriers in NVIDIA GPUs. The act of arriving (and waiting) on a particular barrier doesn't concern which part of the code each warp is at.
 
-- Fun annecdote. At the time of the competition, Codex 5.5 kept telling me this was invalid regardless of my reassurance. I think recent models/agents still think this is invalid too.
+- Fun anecdote. At the time of the competition, Codex 5.5 kept telling me this was invalid regardless of my reassurance. I think recent models/agents still think this is invalid too.
 
 Overall everything looks good up to this point, but I think we can do better. One limitation of `__syncthreads()`/`bar.sync` is that it is both **arrive** and **wait**. For producer warps, it means they have to wait for all consumer warps to arrive before it can continue execution, even though it doesn't need to. Ideally we want something more compact: producers only need to **arrive**, and consumers only need to **wait**. We already have a solution to this: `mbarrier` commonly used in TMA and tcgen05 code for uni-directional memory synchronization.
 
@@ -238,7 +238,7 @@ if (warp == 0 && elect_sync()) {
 __syncthreads();
 
 // consumer phase: update columns with previous reflectors
-for (int panel = 0; panel = warp_id; panel++) {
+for (int panel = 0; panel < warp_id; panel++) {
   for (int i = 0; i < 8; i++) {
     const int col = panel * 8 + i;
     mbar_wait(mbars + col * 8, 0);  // NEW: mbarrier.try_wait loop
@@ -264,7 +264,7 @@ for (int i = 0; i < 8; i++) {
 
 This design also performs well for QR32, and I didn't notice any regression compared to the previous register-resident kernel. Hence, in the final submission, I removed the register-resident kernel and used this kernel for QR32 as well.
 
-**Comparison with standard Warp specialization** In typical Warp specialized GEMM kernels, each warp assumes a single role throughout its lifetime. Our design above is also warp specialization, but the role is not fixed: each warp takes turn acting as a producer. I also experimented with static warp specialization: 1 warp is responsible to compute reflectors, while N other warps update the trailing columns. This was slower than the final design we have here because of the extra data communications: when the producer warp has to compute reflector for column $i$, it needs to wait for the consumer warps to update that column.
+**Comparison with standard Warp specialization** In typical Warp specialized GEMM kernels, each warp assumes a single role throughout its lifetime. Our design above is also warp specialization, but the role is not fixed: each warp takes turns acting as a producer. I also experimented with static warp specialization: 1 warp is responsible for computing the reflectors, while N other warps update the trailing columns. This was slower than the final design we have here because of the extra data communications: when the producer warp has to compute reflector for column $i$, it needs to wait for the consumer warps to update that column.
 
 Our northstar so far has always been "avoid communication as much as possible", and it has been working out quite well. You can find the final kernel at [`register_panel_kernel`](https://github.com/gau-nernst/gpu-mode-kernels/blob/fb291890/linalg/qr_v2/codex/submission.py#L764) (it includes additional features for later development).
 
@@ -301,13 +301,13 @@ trailing = trailing - V @ T^T @ V^T @ trailing
 T^T = inv(diag(1/tau) + strictLower(V^T @ V))
 ```
 
-Everything can be implemented as ordinary PyTorch ops, they are basically a few matmuls and a single matrix inversion. I had a mini Triton kernel to compute `diag(1/tau) + strictLower(gram)`, where `gram = V^T @ V`, in a single kernel but I don't think it matters much anyway.
+Everything can be implemented as ordinary PyTorch ops, they are basically a few matmuls and a matrix inversion. I had a mini Triton kernel to compute `diag(1/tau) + strictLower(gram)`, where `gram = V^T @ V`, in a single kernel but I don't think it matters much anyway.
 
 The `panel_QR` routine is the same as the previous QR kernel, with the only exception that the input matrices are not squares (Well, technically QR decomposition is not limited to square matrices). We also need to output the standalone reflectors for compact WY transform. Looking back at our previous kernel, we can see that this is basically free: we are already storing the reflectors in shared memory to communicate from producer to consumers; hence, we only need to issue TMA store to copy them to global memory, which has very low overhead.
 
 ```cpp
 // consumer phase
-for (int panel = 0; panel = warp_id; panel++) {
+for (int panel = 0; panel < warp_id; panel++) {
   ...
 }
 
@@ -337,9 +337,9 @@ For the larger QR1024 shape, we have to replace 256-bit global loads (8 FP32 ele
 
 With the knowledge of compact WY transform, we can decide to split a matrix into panels in different ways. For example, 512 can be decomposed into 128+128+128+128 or 64+64+128+128+128. I call a particular decomposition a **Panel schedule** (not sure if it's a proper term, it's just how I call it). The next question is to determine an optimal schedule.
 
-If we want to be scientific, I suppose we can build a **Cost model** to predict e2e runtime given a schedule, then optimize the schedule for a particular QR shape (we can either have a performance model for our LEGO kernel pieces - panel QR, compact WY transform, or sample a few data points and fit a curve). However, agents have been excellent at doing autotuning, hence there were no reasons to do anything more sophisticated for the fixed problem shapes. Perhaps for a general QR solution, where we don't know the exact shape ahead of time, a cost model that aids schedule optimization would be useful.
+If we want to be scientific, I suppose we can build a **Cost model** to predict e2e runtime given a schedule, then optimize the schedule for a particular QR shape (we can either have a performance model for our LEGO kernel pieces - panel QR, compact WY transform, or sample a few data points and fit a curve). However, agents have been excellent at doing autotuning, hence there was no reason to do anything more sophisticated for the fixed problem shapes. Perhaps for a general QR solution, where we don't know the exact shape ahead of time, a cost model that aids schedule optimization would be useful.
 
-Another thing to note that an optimal schedule depends on the performance of the constituent kernels: panel QR, tiny GEMMs and matrix inversion in compact WY transform. Our later optimizations in these components require a re-tuning of the panel schedule, hence I only did the exhaustive tuning (i.e. throw it to an agent) near the end of the competition. Regardless, there are some useful heuristics or constraints that help narrow the search space, such as shared memory constraint, and efficient matrix inversion shapes.
+Another thing to note is that an optimal schedule depends on the performance of the constituent kernels: panel QR, tiny GEMMs and matrix inversion in compact WY transform. Our later optimizations in these components require a re-tuning of the panel schedule, hence I only did the exhaustive tuning (i.e. throw it to an agent) near the end of the competition. Regardless, there are some useful heuristics or constraints that help narrow the search space, such as shared memory constraint, and efficient matrix inversion shapes.
 
 {{< figure src="qr512_schedule.svg" width=350 alt="QR512 Panel schedule" caption="Final Panel schedule chosen for QR512: 96+96+128+192. The QR panels are 512x96, 416x96, 320x128, and 192x192." >}}
 
@@ -349,7 +349,7 @@ With the compact WY transform framework in place, we need to make it run faster.
 
 I only experimented up to FP16, which was already not accurate enough in many cases. I can't remember if I tried BF16, but I think BF16 should be less accurate than FP16 since we have more mantissa bits with FP16. One important detail is that I use **FP16 matmul with FP32 output** to maintain precision for later operations e.g. matrix inversion after `V^T @ V`. This can be done directly in PyTorch with `torch.baddbmm(out_dtype=torch.float32)`.
 
-Ideally we also want dtype casting to be fused with prior ops to avoid standalone conversion kernels. Hence, QR panel kernels now also output FP16 reflectors, in addition to FP32 reflectors. Why do we need both precisions? As it turns out, final QR decomposition results are very sensitive to the precision of each matmul happening in compact WY transform. Hence, some matmuls like `gram = V^T @ V` and `V^T @ trailing` have to be kept in TF32, possibly because the reduction dim, which is equal to panel size, is small.
+Ideally we also want dtype casting to be fused with prior ops to avoid standalone conversion kernels. Hence, QR panel kernels now also output FP16 reflectors, in addition to FP32 reflectors. Why do we need both precisions? As it turns out, final QR decomposition results are very sensitive to the precision of each matmul happening in compact WY transform. Hence, some matmuls like `gram = V^T @ V` and `V^T @ trailing` must remain in TF32, possibly because the reduction dim, which is equal to panel size, is small.
 
 ### Triangular matrix inversion
 
@@ -357,13 +357,13 @@ Matrix inversion has always been the annoyingly slow operator. From my prior kno
 
 However, what we can exploit is the **triangular structure** of the matrix that we are taking the inverse of. For unknown reasons, there are no standard triangular matrix inverse functions (technically there is [`cusolverDnXtrtri`](https://docs.nvidia.com/cuda/cusolver/index.html#cusolverdnxtrtri) but it only supports a single matrix, no batch API), only **triangular solve** i.e. compute $Y = X^{-1} A$. We can do triangular solve against an identity matrix for example, but again it won't be optimal.
 
-The approach to triangular matrix inverse is pretty simple: we partition the matrix into 2x2 smaller tiles, and compute the inverse on the 2 diagonal tiles, which are themselves triangular, using [forward substitution](https://en.wikipedia.org/wiki/Triangular_matrix#Forward_substitution). The results for off-diagonal are final. For off-diagonal, we only need to compute one of them, since the other one is zeros, using block forward substitution (the same as foward substitution formula, but replace scalar multiplication with matrix multiplication).
+The approach to triangular matrix inverse is pretty simple: we partition the matrix into 2x2 smaller tiles, and compute the inverse on the 2 diagonal tiles, which are themselves triangular, using [forward substitution](https://en.wikipedia.org/wiki/Triangular_matrix#Forward_substitution). For off-diagonal, we only need to compute one of them, since the other one is zero, using block forward substitution (the same as forward substitution formula, but replace scalar multiplication with matrix multiplication).
 
 {{< figure src="triangular_inverse.svg" width=500 alt="Triangular inverse" caption="Triangular matrix inversion. Forward substitution for diagonal tiles, and block forward substitution for off-diagonal tile." >}}
 
 It was some time ago so I couldn't remember all the details but in the end I only provided 96x96 and 128x128 inverse. One possible reason is that they provide the largest possible panel size under my panel QR design (352x128x4 = 180,224 and 512x96x4 = 196,608 < 228 kB smem limit), and they factor into nice powers of 2 (96 = 64 + 32).
 
-I found that doing repeated, hierarchical 2x2 block forward substitution is faster than 3x3 or 4x4 block forward substitution, even though the latter require less FLOPs. I think it's because 2x2 block requires significantly less memory synchronization, though it can also be a skill issue in my part. For the largest off-diagonal inverse, 64x64 off-diagonal tile in 128x128 inverse and 32x64 in 96x96 inverse, I use PyTorch for the matmuls since I don't think I can write a better one myself.
+I found that doing repeated, hierarchical 2x2 block forward substitution is faster than 3x3 or 4x4 block forward substitution, even though the latter require fewer FLOPs. I think it's because 2x2 block requires significantly less memory synchronization, though it can also be a skill issue in my part. For the largest off-diagonal block inverses, 64x64 off-diagonal tile in 128x128 inverse and 32x64 in 96x96 inverse, I use PyTorch for the matmuls since I don't think I can write a better one myself.
 
 {{< figure src="inverse_96_128.svg" width=600 alt="Inverse 96 and 128" caption="Build up 96x96 and 128x128 triangular inverse from 16x16, 32x32, and 64x64 inverses." >}}
 
@@ -443,23 +443,23 @@ Overall, it's a simple extension from our previous 1-SM kernel. We have more con
 
 Comparing between 1-SM and 2-SM kernels for SM-limited shapes (these numbers were obtained after the competition ended, so treat them more like ablation rather than actual progression during the competition):
 
-Batch | N    | 1-SM timing | 2-SM timing | Speeup
+Batch | N    | 1-SM timing | 2-SM timing | Speedup
 ------|------|-------------|-------------|--------
 40    | 176  |  113.91 us  |   94.65 us  | 20.35%
 40    | 352  |  329.92 us  |  312.90 us  |  5.44%
 60    | 1024 | 2710.90 us  | 2094.09 us  | 29.46%
 
-For QR1024, 1-SM version uses narrower initial panels due to shared memory constraint (48x8 + 128x5 for 1-SM and 96x4 + 128x5 for 2-SM). Hence, some of the gain for QR1024 are coming from wider panels and a better schedule, not just a better QR panel kernel.
+For QR1024, 1-SM version uses narrower initial panels due to shared memory constraint (48x8 + 128x5 for 1-SM and 96x4 + 128x5 for 2-SM). Hence, some of the gain for QR1024 is coming from wider panels and a better schedule, not just a better QR panel kernel.
 
 ## QR2048 and QR4096: Multi-CTA, grid-wide coordination
 
-For QR2048 and QR4096, there are only 8 and 2 matrices respectively per kernel invocation, prompting us to use even more CTAs per QR matrix. Threadblock cluster supports more than 2-CTAs, but they are not scalable: The data transfer (`st.async` and S2S TMA) is push-based, meaning that we would need to push to every consuming CTAs, resulting in extra memory traffic. Doing pull-based data transfer would not improve the situation: not only we still have to do signalling (i.e. the consumer CTAs need to know when data is ready), memory traffic is neither reduced.
+For QR2048 and QR4096, there are only 8 and 2 matrices respectively per kernel invocation, prompting us to use even more CTAs per QR matrix. Threadblock cluster supports more than 2 CTAs, but they are not scalable: The data transfer (`st.async` and S2S TMA) is push-based, meaning that we would need to push to every consuming CTA, resulting in extra memory traffic. Doing pull-based data transfer would not improve the situation: not only we still have to do signalling (i.e. the consumer CTAs need to know when data is ready), memory traffic is neither reduced.
 
 Instead of using threadblock cluster, we can go back to the more traditional inter-CTA synchronization via global memory (or L2 to be exact). Producer CTAs publish reflectors to global memory, and consumer CTAs can read from global memory to update their owned columns. Synchronization is achieved with **GPU-scope release-acquire semantics**.
 
-Another issue with large QR matrix shapes is that 1 warp can't hold the full `[rows, 8]` panel in register memory (2048 x 8 / 32 = 512 registers/thread). Hence, we have no choice but to distribute a single column across multiple warps. This means that many subroutines that require a column reduction, such as computing the reflectors and doing column updates, necessiate cross-warp reduction via shared memory.
+Another issue with large QR matrix shapes is that 1 warp can't hold the full `[rows, 8]` panel in register memory (2048 x 8 / 32 = 512 registers/thread). Hence, we have no choice but to distribute a single column across multiple warps. This means that many subroutines that require a column reduction, such as computing the reflectors and doing column updates, necessitate cross-warp reduction via shared memory.
 
-To keep the code simple, we opt for a straight-forward thread layout: each CTA holds `[rows, 8]` panel, where each thread still loads 8 elements at a time for efficient 256-bit loads. The panel is sharded along the row dimension, where each warp holds `[rows / NUM_WARPS, 8]` tile.
+To keep the code simple, we opt for a straightforward thread layout: each CTA holds `[rows, 8]` panel, where each thread still loads 8 elements at a time for efficient 256-bit loads. The panel is sharded along the row dimension, where each warp holds a `[rows / NUM_WARPS, 8]` tile.
 
 {{< figure src="multi_cta_layout.svg" alt="Layout of Multi-CTA kernel" caption="Layout of Multi-CTA kernel." >}}
 
@@ -480,7 +480,7 @@ The final Multi-SM kernel can be found at [`gmem_panel_kernel`](https://github.c
 I hope what we have gone through in the blogpost feels like a natural progression to the problem.
 - We start with a register-resident kernel because we want to avoid communication as much as possible. A single warp handles a matrix.
 - Then, we come up with a producer-consumer kernel where warps in a CTA cooperate with each other.
-- Next, to better utilize GPU resources, we use 2 CTAs to handle one matrix, which follows the exact same producer-consumer pattern, and utilizing TMA and `st.async` for efficient cross-CTA communication.
+- Next, to better utilize GPU resources, we use 2 CTAs to handle one matrix, which follows the exact same producer-consumer pattern, and utilize TMA and `st.async` for efficient cross-CTA communication.
 - Finally, for even smaller batch sizes, multiple CTAs can coordinate via global memory.
 
 I collected the top 3 submissions and re-ran them on Modal over the problem shapes (timing reported in us).
@@ -503,6 +503,6 @@ batch | n | case | 10billiontokens | gau.nernst (me) | dhu.randhar
 
 Compared to the top submission, I'm quite behind in many cases. However, if you pay close attention, for **mixed cases** (matrices are generated using different methods, so participants can't exploit the same structure across the whole batch), my solution's runtime does not change at all, while others slow down significantly. This is because I made no attempts to detect and exploit structure in the input data at all, though some may argue that tuning the matmul precision in compact WY transform was already "exploiting" the stricter tests of QR512.
 
-For QR176 and QR352, I'm nearly 2 times faster than the best submission, validating the sound design in my kernel. This also made me confident that even though I did not produce the fastest QR kernel, I was sure my panel QR kernel was fastest on the world for B200 at the time of the competition (simply because no one else would write a QR kernel for B200 outside of this competition).
+For QR176 and QR352, I'm nearly 2 times faster than the best submission, validating the sound design in my kernel. This also made me confident that even though I did not produce the fastest QR kernel, I was sure my panel QR kernel was fastest in the world for B200 at the time of the competition (simply because no one else would write a QR kernel for B200 outside this competition).
 
-The relatively bad timing of my QR512, after accounting for not using shortcuts, also reveals a weakness that I miss for this shape: occupancy. Throughout this journey, I have conveniently used up all available SM resources, which is fair for SM-limited shapes, but might not be optimal when batch size is larger than number of SMs. It might be useful to be more conservative with resources in order to increase occupancy (number of active CTAs per SM) for QR512.
+The relatively bad timing of my QR512, after accounting for not using shortcuts, also reveals a weakness that I missed for this shape: occupancy. Throughout this journey, I have conveniently used up all available SM resources, which is fair for SM-limited shapes, but might not be optimal when batch size is larger than number of SMs. It might be useful to be more conservative with resources in order to increase occupancy (number of active CTAs per SM) for QR512.
