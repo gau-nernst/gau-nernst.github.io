@@ -1,11 +1,11 @@
 +++
-date = '2026-09-15T20:00:00+08:00'
+date = '2026-09-27T20:00:00+08:00'
 title = "World's fastest (panel) QR factorization on B200"
 url = 'b200-qr'
 +++
 GPU MODE recently hosted a series of leaderboards for [linear algebra kernels](https://www.gpumode.com/news/linear-algebra-kernels-age-of-research). I participated in the first one, QR decomposition, and claimed the 2nd place. I think it's a breath of fresh air, a departure from the usual LLM-oriented kernels most people program for nowadays.
 
-As usual, my submission is open-sourced at [gau-nernst/gpu-mode-kernels](https://github.com/gau-nernst/gpu-mode-kernels/tree/fb291890aa1fe35648799bf7b2731056240bcabf/linalg/qr_v2).
+As usual, my submission is open-sourced at [gau-nernst/gpu-mode-kernels](https://github.com/gau-nernst/gpu-mode-kernels/tree/fb291890/linalg/qr_v2). The final submission is `codex/submission.py`.
 
 {{< toc >}}
 
@@ -266,7 +266,7 @@ This design also performs well for QR32, and I didn't notice any regression comp
 
 **Comparison with standard Warp specialization** In typical Warp specialized GEMM kernels, each warp assumes a single role throughout its lifetime. Our design above is also warp specialization, but the role is not fixed: each warp takes turn acting as a producer. I also experimented with static warp specialization: 1 warp is responsible to compute reflectors, while N other warps update the trailing columns. This was slower than the final design we have here because of the extra data communications: when the producer warp has to compute reflector for column $i$, it needs to wait for the consumer warps to update that column.
 
-Our northstar so far has always been "avoid communication as much as possible", and it has been working out quite well.
+Our northstar so far has always been "avoid communication as much as possible", and it has been working out quite well. You can find the final kernel at [`register_panel_kernel`](https://github.com/gau-nernst/gpu-mode-kernels/blob/fb291890/linalg/qr_v2/codex/submission.py#L764) (it includes additional features for later development).
 
 ## QR352, QR512, and QR1024: compact WY transform
 
@@ -341,7 +341,7 @@ If we want to be scientific, I suppose we can build a **Cost model** to predict 
 
 Another thing to note that an optimal schedule depends on the performance of the constituent kernels: panel QR, tiny GEMMs and matrix inversion in compact WY transform. Our later optimizations in these components require a re-tuning of the panel schedule, hence I only did the exhaustive tuning (i.e. throw it to an agent) near the end of the competition. Regardless, there are some useful heuristics or constraints that help narrow the search space, such as shared memory constraint, and efficient matrix inversion shapes.
 
-{{< figure src="qr512_schedule.svg" width=400 alt="QR512 Panel schedule" caption="Final Panel schedule chosen for QR512: 96+96+128+192. The QR panels are 512x96, 416x96, 320x128, and 192x192." >}}
+{{< figure src="qr512_schedule.svg" width=350 alt="QR512 Panel schedule" caption="Final Panel schedule chosen for QR512: 96+96+128+192. The QR panels are 512x96, 416x96, 320x128, and 192x192." >}}
 
 ### Low precision matmul
 
@@ -359,13 +359,15 @@ However, what we can exploit is the **triangular structure** of the matrix that 
 
 The approach to triangular matrix inverse is pretty simple: we partition the matrix into 2x2 smaller tiles, and compute the inverse on the 2 diagonal tiles, which are themselves triangular, using [forward substitution](https://en.wikipedia.org/wiki/Triangular_matrix#Forward_substitution). The results for off-diagonal are final. For off-diagonal, we only need to compute one of them, since the other one is zeros, using block forward substitution (the same as foward substitution formula, but replace scalar multiplication with matrix multiplication).
 
-{{< figure src="triangular_inverse.svg" alt="Triangular inverse" caption="Triangular matrix inversion. Forward substitution for diagonal tiles, and block forward substitution for off-diagonal tile." >}}
+{{< figure src="triangular_inverse.svg" width=500 alt="Triangular inverse" caption="Triangular matrix inversion. Forward substitution for diagonal tiles, and block forward substitution for off-diagonal tile." >}}
 
 It was some time ago so I couldn't remember all the details but in the end I only provided 96x96 and 128x128 inverse. One possible reason is that they provide the largest possible panel size under my panel QR design (352x128x4 = 180,224 and 512x96x4 = 196,608 < 228 kB smem limit), and they factor into nice powers of 2 (96 = 64 + 32).
 
 I found that doing repeated, hierarchical 2x2 block forward substitution is faster than 3x3 or 4x4 block forward substitution, even though the latter require less FLOPs. I think it's because 2x2 block requires significantly less memory synchronization, though it can also be a skill issue in my part. For the largest off-diagonal inverse, 64x64 off-diagonal tile in 128x128 inverse and 32x64 in 96x96 inverse, I use PyTorch for the matmuls since I don't think I can write a better one myself.
 
-{{< figure src="inverse_96_128.svg" alt="Inverse 96 and 128" caption="Build up 96x96 and 128x128 triangular inverse from 16x16, 32x32, and 64x64 inverses." >}}
+{{< figure src="inverse_96_128.svg" width=600 alt="Inverse 96 and 128" caption="Build up 96x96 and 128x128 triangular inverse from 16x16, 32x32, and 64x64 inverses." >}}
+
+The core logic of the final compact WY transform implementation can be found at [`compact_wy_apply_transpose`](https://github.com/gau-nernst/gpu-mode-kernels/blob/fb291890/linalg/qr_v2/codex/submission.py#L1493).
 
 ## QR1024: 2-CTA, threadblock cluster communication
 
@@ -437,9 +439,17 @@ for (int i = 0; i < 8; i++) {
 
 The reflector itself is already stored in shared memory for consumer warps within the same CTA, hence we only need to issue an additional shared-to-shared TMA. For tau, we use `st.async`, which should be faster than normal store (I didn't measure but I hope it's faster in the sense that it's non-blocking so the producer warp can continue its execution). To get CTA1's shared memory address, we simply set a particular bit, instead of [clearing it](https://github.com/NVIDIA/cutlass/blob/v4.7.1/include/cute/arch/copy_sm100_tma.hpp#L63) as in the original tcgen05 tutorial.
 
-Overall, it's a simple extension from our previous 1-SM kernel. We have more consumers, and they reside in another SM, hence we need to send data and signal to them. Another added benefit from 2-SM kernel is that **we can double the panel width** since each CTA only needs to hold half number of reflectors. Comparing between 1-SM and 2-SM kernels for SM-limited shapes:
+Overall, it's a simple extension from our previous 1-SM kernel. We have more consumers, and they reside in another SM, hence we need to send data and signal to them. Another added benefit from 2-SM kernel is that **we can double the panel width** since each CTA only needs to hold half number of reflectors. This is particularly helpful for large shapes (QR1024), since we can now process more columns at the same time. You can find the 2-SM kernel as [`register_2sm_panel_kernel`](https://github.com/gau-nernst/gpu-mode-kernels/blob/fb291890/linalg/qr_v2/codex/submission.py#L914) in my submission.
 
-TODO: 1-SM and 2-SM kernel perf comparison
+Comparing between 1-SM and 2-SM kernels for SM-limited shapes (these numbers were obtained after the competition ended, so treat them more like ablation rather than actual progression during the competition):
+
+Batch | N    | 1-SM timing | 2-SM timing | Speeup
+------|------|-------------|-------------|--------
+40    | 176  |  113.91 us  |   94.65 us  | 20.35%
+40    | 352  |  329.92 us  |  312.90 us  |  5.44%
+60    | 1024 | 2710.90 us  | 2094.09 us  | 29.46%
+
+For QR1024, 1-SM version uses narrower initial panels due to shared memory constraint (48x8 + 128x5 for 1-SM and 96x4 + 128x5 for 2-SM). Hence, some of the gain for QR1024 are coming from wider panels and a better schedule, not just a better QR panel kernel.
 
 ## QR2048 and QR4096: Multi-CTA, grid-wide coordination
 
@@ -451,14 +461,19 @@ Another issue with large QR matrix shapes is that 1 warp can't hold the full `[r
 
 To keep the code simple, we opt for a straight-forward thread layout: each CTA holds `[rows, 8]` panel, where each thread still loads 8 elements at a time for efficient 256-bit loads. The panel is sharded along the row dimension, where each warp holds `[rows / NUM_WARPS, 8]` tile.
 
-TODO: diagram compare before and after
+{{< figure src="multi_cta_layout.svg" alt="Layout of Multi-CTA kernel" caption="Layout of Multi-CTA kernel." >}}
 
-```cpp
-// (NEW) consumer: update reflectors produced by earlier CTAs
-for (int k = 0; k)
-```
+- The original 1-SM kernel has a limit on panel height from **registers per thread constraint**, 255 registers per thread, where we can conservatively allocate 200 registers for holding the matrix. That works out to be around 800 tall for 256-bit loads, and 1600 tall for 128-bit loads (we use 128-bit loads for QR1024 exactly for this reason).
+- Panel height in Multi-SM kernel is limited by shared memory capacity. Again, we can reserve a conservative amount of 200kB out of the 227kB capacity, leaving the height limit to 6250, sufficient for QR4096.
 
-We put some efforts to make sure the memory synchronization has low overheads. The flag is polled with `.relaxed.gpu.L1::no_allocate`. `.relaxed` helps to observe the flag cheaply, while acquire semantics is achieved with the later `fence.acquire.gpu`. `.L1::no_allocate` helps with cache behavior - caching the `false` flag value has no benefit, we are trying to observe the flip as soon as possible! Also only one thread polls the flag to avoid hammering the memory subsystem - ordering for other threads in a CTA is achieved using another `__syncthreads()`.
+We put some efforts to make sure the memory synchronization has low overheads. The flag is polled with `.relaxed.gpu.L1::no_allocate`.
+- `.relaxed` makes flag observation cheaper, while acquire semantics is achieved with the later `fence.acquire.gpu`:
+- `.L1::no_allocate` improves cache behavior - caching the `false` flag value has no benefit, we are trying to observe the flip as soon as possible!
+- Also only one thread polls the flag to avoid hammering the memory subsystem - ordering for other threads in a CTA is achieved using another `__syncthreads()`.
+
+{{< figure src="multi_cta_sync.svg" width=600 alt="Memory synchronization in Multi-SM kernel" caption="Memory synchronization in Multi-SM kernel." >}}
+
+The final Multi-SM kernel can be found at [`gmem_panel_kernel`](https://github.com/gau-nernst/gpu-mode-kernels/blob/fb291890/linalg/qr_v2/codex/submission.py#L1123).
 
 ## Final remarks
 
