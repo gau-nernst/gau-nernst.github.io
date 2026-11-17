@@ -26,3 +26,8 @@ theme = "paper"
 [caches]
   [caches.images]
     dir = ':cacheDir/images'
+
+[[menu.main]]
+  name = "Apps"
+  url = "/apps/"
+  weight = 1
